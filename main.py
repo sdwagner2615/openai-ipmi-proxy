@@ -34,7 +34,6 @@ http_client: httpx.AsyncClient = None
 # Central state object to track the physical server status and activity across async tasks.
 state = {
     "last_request_time": time.time(),
-    "active_requests": 0,
     "is_powered_on": None,
     "is_healthy": None,
     "last_power_on_attempt": 0,
@@ -159,12 +158,6 @@ async def idle_monitor():
         await asyncio.sleep(60)
         elapsed = time.time() - state["last_request_time"]
         if elapsed > IDLE_TIMEOUT:
-            # We check active_requests to ensure we don't kill the server
-            # while a long-running LLM response is still streaming to a client.
-            if state["active_requests"] > 0:
-                logger.info(f"Server idle for {elapsed:.0f}s, but {state['active_requests']} requests are still active. Waiting...")
-                continue
-
             # Verify actual power state before attempting shutdown to avoid redundant API calls.
             actual_power = await get_power_state()
             if actual_power is True:
@@ -208,8 +201,7 @@ async def proxy(request: Request, path: str):
     for a configurable timeout before giving up.
     """
     state["last_request_time"] = time.time()
-    state["active_requests"] += 1
-    logger.debug(f"Request received for {path}, resetting idle timer. Active requests: {state['active_requests']}")
+    logger.debug(f"Request received for {path}, resetting idle timer.")
     
     # Initial health check and potential power-on trigger
     if not await check_health():
@@ -228,7 +220,6 @@ async def proxy(request: Request, path: str):
         
         # If still unhealthy after polling, return the loading error
         if not await check_health():
-            state["active_requests"] -= 1
             return JSONResponse(
                 status_code=503,
                 content={
@@ -276,10 +267,9 @@ async def proxy(request: Request, path: str):
                 logger.error(f"Unexpected error during streaming: {e}")
                 yield f" [Error: {str(e)}] ".encode()
             finally:
-                # Ensure the connection is closed and the active request count is decremented.
+                # Ensure the connection is closed.
                 await response.aclose()
-                state["active_requests"] -= 1
-                logger.debug(f"Request for {path} finished. Active requests: {state['active_requests']}")
+                logger.debug(f"Request for {path} finished.")
 
         return StreamingResponse(
             stream_generator(),
@@ -288,6 +278,5 @@ async def proxy(request: Request, path: str):
         )
 
     except Exception as e:
-        state["active_requests"] -= 1
         logger.error(f"Proxy error: {e}")
         return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
