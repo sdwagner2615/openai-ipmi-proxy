@@ -36,8 +36,8 @@ jobs:
           
           if [ -z "$LATEST_TAG" ]; then
             VERSION="0.0.0"
-            # Use the first commit as the base for analyzing changes
-            LOG_RANGE=$(git rev-list --max-parents=0 HEAD)..HEAD
+            # Analyze all commits if no tag exists
+            LOG_RANGE="HEAD"
           else
             VERSION=${LATEST_TAG#v}
             LOG_RANGE="$LATEST_TAG..HEAD"
@@ -51,9 +51,9 @@ jobs:
           BUMP="patch"
           
           # Analyze commits in the range for Conventional Commit markers
-          if git log $LOG_RANGE --grep="BREAKING CHANGE"; then
+          if [ -n "$(git log $LOG_RANGE --grep="BREAKING CHANGE")" ]; then
             BUMP="major"
-          elif git log $LOG_RANGE --grep="^feat"; then
+          elif [ -n "$(git log $LOG_RANGE --grep="^feat")" ]; then
             BUMP="minor"
           fi
           
