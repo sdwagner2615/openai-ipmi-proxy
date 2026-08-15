@@ -18,33 +18,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Install git-cliff
         run: |
-          curl -sL https://github.com/bozgrunge/git-cliff/releases/download/v0.17.0/git-cliff-applet-linux-amd64.tar.gz | tar xz
+          curl -sL https://github.com/bozgrunge/git-cliff/releases/download/v0.17.0/git-cliff-linux-amd64 -o git-cliff
+          chmod +x git-cliff
           sudo mv git-cliff /usr/local/bin/
 
       - name: Determine Next Version
         id: versioning
         run: |
-          # Get latest tag or default to v0.0.0
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          # Get latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           echo "Latest tag: $LATEST_TAG"
           
-          # Extract version numbers
-          VERSION=${LATEST_TAG#v}
+          if [ -z "$LATEST_TAG" ]; then
+            VERSION="0.0.0"
+            # Use the first commit as the base for analyzing changes
+            LOG_RANGE=$(git rev-list --max-parents=0 HEAD)..HEAD
+          else
+            VERSION=${LATEST_TAG#v}
+            LOG_RANGE="$LATEST_TAG..HEAD"
+          fi
+          
           MAJOR=$(echo $VERSION | cut -d. -f1)
           MINOR=$(echo $VERSION | cut -d. -f2)
           PATCH=$(echo $VERSION | cut -d. -f3)
           
-          # Analyze commits since last tag
-          # Major: BREAKING CHANGE
-          # Minor: feat:
-          # Patch: fix: or anything else
-          
+          # Default to patch
           BUMP="patch"
-          if git log $LATEST_TAG..HEAD --grep="BREAKING CHANGE"; then
+          
+          # Analyze commits in the range for Conventional Commit markers
+          if git log $LOG_RANGE --grep="BREAKING CHANGE"; then
             BUMP="major"
-          elif git log $LATEST_TAG..HEAD --grep="^feat"; then
+          elif git log $LOG_RANGE --grep="^feat"; then
             BUMP="minor"
           fi
           
