@@ -74,6 +74,14 @@ jobs:
           echo "New tag: $NEW_TAG"
           echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
 
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          git-cliff --unreleased -o changelog.md
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          cat changelog.md >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
       - name: Create Tag
         run: |
           git config user.name "github-actions[bot]"
@@ -97,14 +105,6 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/openai-ipmi-proxy:latest
             ghcr.io/${{ github.repository_owner }}/openai-ipmi-proxy:${{ steps.versioning.outputs.new_tag }}
 
-      - name: Generate Changelog
-        id: changelog
-        run: |
-          git-cliff --unreleased > changelog.md
-          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
-          cat changelog.md >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
@@ -112,3 +112,5 @@ jobs:
           body: ${{ env.CHANGELOG }}
           draft: false
           prerelease: false
+
+
