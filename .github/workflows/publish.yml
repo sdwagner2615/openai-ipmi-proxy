@@ -23,8 +23,8 @@ jobs:
 
       - name: Install git-cliff
         run: |
-          curl -sL https://github.com/bozgrunge/git-cliff/releases/download/v0.17.0/git-cliff-linux-amd64 -o git-cliff
-          chmod +x git-cliff
+          curl -sL https://github.com/orhun/git-cliff/releases/download/v2.13.1/git-cliff-2.13.1-x86_64-unknown-linux-gnu.tar.gz -o git-cliff.tar.gz
+          tar -xzf git-cliff.tar.gz
           sudo mv git-cliff /usr/local/bin/
 
       - name: Determine Next Version
