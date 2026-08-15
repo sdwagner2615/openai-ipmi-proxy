@@ -80,6 +80,7 @@ jobs:
           git-cliff --unreleased -o changelog.md
           echo "CHANGELOG<<EOF" >> $GITHUB_ENV
           cat changelog.md >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
       - name: Create Tag
