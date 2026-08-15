@@ -23,6 +23,7 @@ IPMI_USER = os.getenv("IPMI_USER")
 IPMI_PASS = os.getenv("IPMI_PASS")
 TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
+BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 30))
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
@@ -203,78 +204,90 @@ async def proxy(request: Request, path: str):
     OpenAI-compatible proxy endpoint that manages server power state.
 
     This endpoint forwards requests to the target AI server if it is healthy.
-    If the server is off, it triggers a power-on and returns a 503 error.
+    If the server is off, it triggers a power-on and polls the health endpoint
+    for a configurable timeout before giving up.
     """
     state["last_request_time"] = time.time()
     state["active_requests"] += 1
     logger.debug(f"Request received for {path}, resetting idle timer. Active requests: {state['active_requests']}")
     
-    if await check_health():
-        url = f"{TARGET_SERVER_URL}/{path}"
-        body = await request.body()
-        headers = dict(request.headers)
-        # Remove host header to prevent the target server from rejecting the request due to host mismatch.
-        headers.pop("host", None)
-
-        try:
-            # We define the timeout on the Request object. 
-            # a read timeout of 300s is used to accommodate long LLM generation times.
-            req = http_client.build_request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                timeout=httpx.Timeout(None, read=300.0)
-            )
-            
-            response = await http_client.send(req, stream=True)
-            
-            async def stream_generator():
-                """
-                Generator to forward raw bytes from the target server to the client.
-                This enables SSE (Server-Sent Events) support for streaming LLM responses.
-                """
-                try:
-                    async for chunk in response.aiter_raw():
-                        yield chunk
-                except httpx.ReadTimeout:
-                    logger.error("Read timeout occurred during streaming from AI server")
-                    yield b" [Error: Read Timeout] "
-                except Exception as e:
-                    logger.error(f"Unexpected error during streaming: {e}")
-                    yield f" [Error: {str(e)}] ".encode()
-                finally:
-                    # Ensure the connection is closed and the active request count is decremented.
-                    await response.aclose()
-                    state["active_requests"] -= 1
-                    logger.debug(f"Request for {path} finished. Active requests: {state['active_requests']}")
-
-            return StreamingResponse(
-                stream_generator(),
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-
-        except Exception as e:
-            state["active_requests"] -= 1
-            logger.error(f"Proxy error: {e}")
-            return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
-    else:
-        state["active_requests"] -= 1
-        # Server is down or loading. Trigger power on if cooldown has passed.
+    # Initial health check and potential power-on trigger
+    if not await check_health():
         now = time.time()
         if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
             await power_on()
             state["last_power_on_attempt"] = now
-            
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": {
-                    "message": "The model is still loading. Please retry in a few moments.",
-                    "type": "server_error",
-                    "param": None,
-                    "code": "model_loading"
+        
+        # Polling loop: wait for the server to become healthy within the BOOT_WAIT_TIMEOUT window
+        start_poll = time.time()
+        while (time.time() - start_poll) < BOOT_WAIT_TIMEOUT:
+            await asyncio.sleep(2)
+            if await check_health():
+                logger.info(f"Server became healthy after {time.time() - start_poll:.1f}s polling.")
+                break
+        
+        # If still unhealthy after polling, return the loading error
+        if not await check_health():
+            state["active_requests"] -= 1
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "message": "The model is still loading. Please retry in a few moments.",
+                        "type": "server_error",
+                        "param": None,
+                        "code": "model_loading"
+                    }
                 }
-            }
+            )
+
+    # Proceed to proxy the request now that the server is confirmed healthy
+    url = f"{TARGET_SERVER_URL}/{path}"
+    body = await request.body()
+    headers = dict(request.headers)
+    # Remove host header to prevent the target server from rejecting the request due to host mismatch.
+    headers.pop("host", None)
+
+    try:
+        # We define the timeout on the Request object. 
+        # a read timeout of 300s is used to accommodate long LLM generation times.
+        req = http_client.build_request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+            timeout=httpx.Timeout(None, read=300.0)
         )
+        
+        response = await http_client.send(req, stream=True)
+        
+        async def stream_generator():
+            """
+            Generator to forward raw bytes from the target server to the client.
+            This enables SSE (Server-Sent Events) support for streaming LLM responses.
+            """
+            try:
+                async for chunk in response.aiter_raw():
+                    yield chunk
+            except httpx.ReadTimeout:
+                logger.error("Read timeout occurred during streaming from AI server")
+                yield b" [Error: Read Timeout] "
+            except Exception as e:
+                logger.error(f"Unexpected error during streaming: {e}")
+                yield f" [Error: {str(e)}] ".encode()
+            finally:
+                # Ensure the connection is closed and the active request count is decremented.
+                await response.aclose()
+                state["active_requests"] -= 1
+                logger.debug(f"Request for {path} finished. Active requests: {state['active_requests']}")
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=response.status_code,
+            headers=dict(response.headers)
+        )
+
+    except Exception as e:
+        state["active_requests"] -= 1
+        logger.error(f"Proxy error: {e}")
+        return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
