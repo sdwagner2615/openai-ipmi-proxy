@@ -1,0 +1,105 @@
+name: Publish Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: |
+          curl -sL https://github.com/bozgrunge/git-cliff/releases/download/v0.17.0/git-cliff-applet-linux-amd64.tar.gz | tar xz
+          sudo mv git-cliff /usr/local/bin/
+
+      - name: Determine Next Version
+        id: versioning
+        run: |
+          # Get latest tag or default to v0.0.0
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+          
+          # Extract version numbers
+          VERSION=${LATEST_TAG#v}
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+          
+          # Analyze commits since last tag
+          # Major: BREAKING CHANGE
+          # Minor: feat:
+          # Patch: fix: or anything else
+          
+          BUMP="patch"
+          if git log $LATEST_TAG..HEAD --grep="BREAKING CHANGE"; then
+            BUMP="major"
+          elif git log $LATEST_TAG..HEAD --grep="^feat"; then
+            BUMP="minor"
+          fi
+          
+          echo "Bumping $BUMP"
+          
+          if [ "$BUMP" == "major" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [ "$BUMP" == "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+          
+          NEW_TAG="v$MAJOR.$MINOR.$PATCH"
+          echo "New tag: $NEW_TAG"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.versioning.outputs.new_tag }}
+          git push origin ${{ steps.versioning.outputs.new_tag }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/openai-ipmi-proxy:latest
+            ghcr.io/${{ github.repository_owner }}/openai-ipmi-proxy:${{ steps.versioning.outputs.new_tag }}
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          git-cliff --unreleased > changelog.md
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          cat changelog.md >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.versioning.outputs.new_tag }}
+          body: ${{ env.CHANGELOG }}
+          draft: false
+          prerelease: false
