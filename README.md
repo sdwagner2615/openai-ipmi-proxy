@@ -32,7 +32,7 @@ This proxy allows high-power AI workstations to remain powered off when not in u
    - `IPMI_PASS`: IPMI password.
    - `TARGET_SERVER_URL`: The URL of the llama.cpp server on the workstation.
    - `IDLE_TIMEOUT`: Seconds of inactivity before shutdown (default: 3600).
-   - `BOOT_WAIT_TIMEOUT`: Seconds to poll the health endpoint before returning a 503 (default: 30).
+   - `BOOT_WAIT_TIMEOUT`: Seconds to poll the health endpoint before returning a 503 (default: 300).
 
 ## Running
 

@@ -23,7 +23,7 @@ IPMI_USER = os.getenv("IPMI_USER")
 IPMI_PASS = os.getenv("IPMI_PASS")
 TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
-BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 30))
+BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 300))
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
