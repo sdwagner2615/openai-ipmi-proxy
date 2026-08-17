@@ -9,7 +9,8 @@ This proxy allows high-power AI workstations to remain powered off when not in u
 - **Automatic Wake-on-Request**: Triggers a Redfish `PowerOn` command if the target server is offline.
 - **Smart Boot Polling**: Instead of failing immediately, the proxy polls the server's health endpoint for a configurable window (`BOOT_WAIT_TIMEOUT`) to allow the server to boot before returning a response.
 - **Full Streaming Support**: Transparently proxies Server-Sent Events (SSE) for real-time token streaming.
-- **Auto-Shutdown**: Shuts down the workstation via `GracefulShutdown` after a period of inactivity (`IDLE_TIMEOUT`).
+- **Auto-Shutdown**: Shuts down the workstation via `GracefulShutdown` after a period of inactivity (`IDLE_TIMEOUT`) — but only if the proxy manages its power (see *Power Ownership* below).
+- **Sleep-Safe Idle Timer**: Idle time is measured with a monotonic clock, so the proxy host going to sleep (or an NTP jump) never triggers a false shutdown on wake.
 - **OpenAI Compatible**: Implements the standard OpenAI API interface.
 
 ## Design Decisions
@@ -18,6 +19,8 @@ This proxy allows high-power AI workstations to remain powered off when not in u
 - **Redfish Protocol**: Uses the Redfish API instead of traditional IPMI-tool for better compatibility with modern BMCs and support for graceful OS shutdowns.
 - **Global Async Client**: Uses a single shared `httpx.AsyncClient` to enable connection pooling, reducing latency and avoiding socket exhaustion.
 - **Streaming Architecture**: Implemented using `StreamingResponse` and `aiter_raw` to ensure that low-latency token streaming from `llama.cpp` is preserved.
+- **Power Ownership**: The proxy only powers the server *off* if it owns the power lifecycle. It takes ownership when it powers the server on, or when any request is routed through it (adopting an already-running server). Ownership is cleared when the proxy shuts the server down. This means a workstation you turned on manually — and never use through the proxy — is never shut down by it.
+- **Monotonic Idle Clock**: Idle time is tracked with `time.monotonic()` rather than wall-clock time. On Linux this clock freezes while the host is asleep and ignores NTP steps, so a long laptop sleep can't make the proxy believe the server has been idle and power it off on wake.
 
 ## Setup
 
@@ -31,8 +34,9 @@ This proxy allows high-power AI workstations to remain powered off when not in u
    - `IPMI_USER`: IPMI username.
    - `IPMI_PASS`: IPMI password.
    - `TARGET_SERVER_URL`: The URL of the llama.cpp server on the workstation.
-   - `IDLE_TIMEOUT`: Seconds of inactivity before shutdown (default: 3600).
-   - `BOOT_WAIT_TIMEOUT`: Seconds to poll the health endpoint before returning a 503 (default: 300).
+    - `IDLE_TIMEOUT`: Seconds of inactivity before shutdown (default: 3600).
+    - `BOOT_WAIT_TIMEOUT`: Seconds to poll the health endpoint before returning a 503 (default: 300).
+    - `SHUTDOWN_ENABLED`: Set to `false` to disable idle auto-shutdown entirely (power-on still works) (default: `true`).
 
 ## Running
 

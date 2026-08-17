@@ -24,6 +24,9 @@ IPMI_PASS = os.getenv("IPMI_PASS")
 TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
 BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 300))
+# Kill switch for the idle auto-shutdown. Power-on still works when disabled;
+# it only stops the proxy from ever shutting the workstation down.
+SHUTDOWN_ENABLED = os.getenv("SHUTDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
@@ -32,10 +35,21 @@ http_client: httpx.AsyncClient = None
 
 # State
 # Central state object to track the physical server status and activity across async tasks.
+#
+# Why time.monotonic() instead of time.time(): the idle timer must measure how long the
+# proxy itself has been active, not wall-clock time. time.monotonic() (CLOCK_MONOTONIC on
+# Linux) freezes while the host laptop is asleep and is immune to NTP step adjustments, so
+# a long sleep cannot make the proxy think the server has been idle and shut it down on wake.
+#
+# manage_power_with_proxy: the proxy only ever powers the server OFF if it is managing the
+# power lifecycle. It takes ownership when it powers the server ON, or when any request is
+# routed through it (adopting an already-running server). A server turned on manually and
+# never used through the proxy is left alone.
 state = {
-    "last_request_time": time.time(),
+    "last_request_time": time.monotonic(),
     "is_powered_on": None,
     "is_healthy": None,
+    "manage_power_with_proxy": False,
     "last_power_on_attempt": 0,
     "power_on_cooldown": 30,
     "discovered_system_path": "/redfish/v1/Systems/Self" # Hardcoded after discovery of BMC firmware behavior
@@ -97,6 +111,9 @@ async def power_on():
     res = await redfish_request("POST", endpoint, {"ResetType": "On"})
     if res and res.status_code in (200, 202, 204):
         state["is_powered_on"] = True
+        # The proxy initiated this power-on, so it now owns the power lifecycle
+        # and is allowed to shut the server down again after idle timeout.
+        state["manage_power_with_proxy"] = True
     return res
 
 async def power_off():
@@ -111,6 +128,9 @@ async def power_off():
     res = await redfish_request("POST", endpoint, {"ResetType": "GracefulShutdown"})
     if res and res.status_code in (200, 202, 204):
         state["is_powered_on"] = False
+        # Ownership ends when the proxy shuts the server down. If it is turned
+        # back on manually afterwards, the proxy must not shut it down again.
+        state["manage_power_with_proxy"] = False
     return res
 
 async def check_health():
@@ -153,18 +173,29 @@ async def sync_state():
 async def idle_monitor():
     """
     Background task that shuts down the server after a period of inactivity.
+
+    The server is only shut down if the proxy manages its power lifecycle
+    (state["manage_power_with_proxy"]). A server that was turned on manually
+    and never used through the proxy is never powered off by this monitor.
     """
     while True:
         await asyncio.sleep(60)
-        elapsed = time.time() - state["last_request_time"]
+        # Auto-shutdown disabled via SHUTDOWN_ENABLED: power-on still works,
+        # we just never take the server down.
+        if not SHUTDOWN_ENABLED:
+            continue
+        elapsed = time.monotonic() - state["last_request_time"]
         if elapsed > IDLE_TIMEOUT:
             # Verify actual power state before attempting shutdown to avoid redundant API calls.
             actual_power = await get_power_state()
             if actual_power is True:
-                logger.info(f"Server idle for {elapsed:.0f}s. Actual state: ON. Shutting down...")
-                await power_off()
-                # Reset timer to prevent immediate repeated shutdown attempts.
-                state["last_request_time"] = time.time()
+                if state["manage_power_with_proxy"]:
+                    logger.info(f"Server idle for {elapsed:.0f}s. Actual state: ON. Shutting down...")
+                    await power_off()
+                else:
+                    logger.info(f"Server idle for {elapsed:.0f}s but was powered on outside the proxy. Leaving it on.")
+                # Reset timer to prevent immediate repeated shutdown attempts (or re-polls).
+                state["last_request_time"] = time.monotonic()
             elif actual_power is False:
                 logger.debug("Server already off, skipping shutdown.")
             else:
@@ -200,22 +231,26 @@ async def proxy(request: Request, path: str):
     If the server is off, it triggers a power-on and polls the health endpoint
     for a configurable timeout before giving up.
     """
-    state["last_request_time"] = time.time()
+    state["last_request_time"] = time.monotonic()
     logger.debug(f"Request received for {path}, resetting idle timer.")
+    # Any request routed through the proxy means the proxy is now serving this
+    # server, so it adopts power management (even if the server was already on).
+    # This is what makes the idle monitor allowed to shut it down later.
+    state["manage_power_with_proxy"] = True
     
     # Initial health check and potential power-on trigger
     if not await check_health():
-        now = time.time()
+        now = time.monotonic()
         if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
             await power_on()
             state["last_power_on_attempt"] = now
         
         # Polling loop: wait for the server to become healthy within the BOOT_WAIT_TIMEOUT window
-        start_poll = time.time()
-        while (time.time() - start_poll) < BOOT_WAIT_TIMEOUT:
+        start_poll = time.monotonic()
+        while (time.monotonic() - start_poll) < BOOT_WAIT_TIMEOUT:
             await asyncio.sleep(2)
             if await check_health():
-                logger.info(f"Server became healthy after {time.time() - start_poll:.1f}s polling.")
+                logger.info(f"Server became healthy after {time.monotonic() - start_poll:.1f}s polling.")
                 break
         
         # If still unhealthy after polling, return the loading error
