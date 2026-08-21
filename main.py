@@ -22,6 +22,12 @@ IPMI_HOST = os.getenv("IPMI_HOST")
 IPMI_USER = os.getenv("IPMI_USER")
 IPMI_PASS = os.getenv("IPMI_PASS")
 TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
+# Path of the target's liveness endpoint. The proxy itself is path-transparent
+# (it forwards whatever API the client speaks - OpenAI chat, Anthropic
+# Messages, etc.), but the power-on decision depends on this one route, so it
+# must match the target server (llama.cpp/vLLM: /health, LiteLLM:
+# /health/liveliness).
+HEALTH_PATH = "/" + os.getenv("HEALTH_PATH", "/health").lstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
 BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 300))
 # Kill switch for the idle auto-shutdown. Power-on still works when disabled;
@@ -140,7 +146,7 @@ async def check_health():
     Returns:
         bool: True if the server is responsive and healthy, False otherwise.
     """
-    url = f"{TARGET_SERVER_URL}/health"
+    url = f"{TARGET_SERVER_URL}{HEALTH_PATH}"
     try:
         # Short timeout to avoid blocking the main request flow.
         response = await http_client.get(url, timeout=httpx.Timeout(2.0))

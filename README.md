@@ -21,6 +21,7 @@ This proxy allows high-power AI workstations to remain powered off when not in u
 - **Streaming Architecture**: Implemented using `StreamingResponse` and `aiter_raw` to ensure that low-latency token streaming from `llama.cpp` is preserved.
 - **Power Ownership**: The proxy only powers the server *off* if it owns the power lifecycle. It takes ownership when it powers the server on, or when any request is routed through it (adopting an already-running server). Ownership is cleared when the proxy shuts the server down. This means a workstation you turned on manually — and never use through the proxy — is never shut down by it.
 - **Monotonic Idle Clock**: Idle time is tracked with `time.monotonic()` rather than wall-clock time. On Linux this clock freezes while the host is asleep and ignores NTP steps, so a long laptop sleep can't make the proxy believe the server has been idle and power it off on wake.
+- **Path-Transparent Proxying**: The proxy forwards every path to the target verbatim with no API-specific logic, so it works with whatever API the target serves (OpenAI chat completions, Anthropic Messages, etc.). The only target-specific assumption is the liveness route (`HEALTH_PATH`), which is configurable.
 
 ## Setup
 
@@ -33,8 +34,9 @@ This proxy allows high-power AI workstations to remain powered off when not in u
    - `IPMI_HOST`: IP address of the IPMI interface.
    - `IPMI_USER`: IPMI username.
    - `IPMI_PASS`: IPMI password.
-   - `TARGET_SERVER_URL`: The URL of the llama.cpp server on the workstation.
-    - `IDLE_TIMEOUT`: Seconds of inactivity before shutdown (default: 3600).
+    - `TARGET_SERVER_URL`: The URL of the llama.cpp server on the workstation.
+    - `HEALTH_PATH`: The path of the target's health endpoint (default: `/health`; e.g. `/health/liveliness` for LiteLLM).
+     - `IDLE_TIMEOUT`: Seconds of inactivity before shutdown (default: 3600).
     - `BOOT_WAIT_TIMEOUT`: Seconds to poll the health endpoint before returning a 503 (default: 300).
     - `SHUTDOWN_ENABLED`: Set to `false` to disable idle auto-shutdown entirely (power-on still works) (default: `true`).
 
