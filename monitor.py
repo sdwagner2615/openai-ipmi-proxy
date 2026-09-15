@@ -39,9 +39,11 @@ HTML_PAGE = """<!doctype html>
          padding: 0 1rem; }
   h1 { font-size: 1.2rem; margin-bottom: 1rem; }
   h2 { font-size: 1rem; margin-top: 1.6rem; }
+  .tablewrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: .82rem; }
-  th, td { border: 1px solid #333; padding: .35rem .6rem; text-align: left;
-           white-space: nowrap; }
+  th, td { border: 1px solid #333; padding: .35rem .6rem; text-align: left; }
+  th.nw, td.nw { white-space: nowrap; }
+  td.wrap { overflow-wrap: anywhere; word-break: break-word; }
   th { background: #1c1c1c; color: #aaa; }
   tr:nth-child(even) td { background: #161616; }
   .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -58,6 +60,7 @@ HTML_PAGE = """<!doctype html>
 <h1>IPMI Proxy Monitor <span id="updated"></span></h1>
 <div id="config" class="kv"></div>
 <h2>Sessions (queue order)</h2>
+<div class="tablewrap">
 <table id="sessions">
   <thead><tr>
     <th>#</th><th>session</th><th>client</th><th>api</th><th>status</th>
@@ -66,7 +69,9 @@ HTML_PAGE = """<!doctype html>
   </tr></thead>
   <tbody></tbody>
 </table>
+</div>
 <h2>Unknown API sessions</h2>
+<div class="tablewrap">
 <table id="unknown">
   <thead><tr>
     <th>client</th><th>method</th><th>target url</th><th>requests</th>
@@ -74,6 +79,7 @@ HTML_PAGE = """<!doctype html>
   </tr></thead>
   <tbody></tbody>
 </table>
+</div>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
@@ -85,29 +91,29 @@ function render(d) {
     '<div><b>' + esc(k) + ':</b> ' + esc(v) + '</div>').join('');
 
   const rows = d.sessions.map((s) => '<tr>' +
-    '<td>' + s.position + '</td>' +
-    '<td>' + esc(s.session) + '</td>' +
-    '<td>' + esc(s.client) + '</td>' +
-    '<td>' + esc(s.api) + '</td>' +
-    '<td class="status ' + s.status + '">' + esc(s.status) +
+    '<td class="nw">' + s.position + '</td>' +
+    '<td class="wrap">' + esc(s.session) + '</td>' +
+    '<td class="nw">' + esc(s.client) + '</td>' +
+    '<td class="nw">' + esc(s.api) + '</td>' +
+    '<td class="status nw ' + s.status + '">' + esc(s.status) +
       (s.detail ? ' <span class="muted">' + esc(s.detail) + '</span>' : '') + '</td>' +
-    '<td>' + s.spot + '</td>' +
-    '<td>' + (s.spot_releases_in === null ? '-' : s.spot_releases_in + 's') + '</td>' +
-    '<td>' + s.inflight + '</td>' +
-    '<td>' + s.waiting + '</td>' +
-    '<td>' + (s.queue_position === null ? '-' : s.queue_position) + '</td>' +
-    '<td>' + esc(s.last_path) + '</td>' +
-    '<td>' + esc(s.client_ip) + '</td>' +
+    '<td class="nw">' + s.spot + '</td>' +
+    '<td class="nw">' + (s.spot_releases_in === null ? '-' : s.spot_releases_in + 's') + '</td>' +
+    '<td class="nw">' + s.inflight + '</td>' +
+    '<td class="nw">' + s.waiting + '</td>' +
+    '<td class="nw">' + (s.queue_position === null ? '-' : s.queue_position) + '</td>' +
+    '<td class="wrap">' + esc(s.last_path) + '</td>' +
+    '<td class="nw">' + esc(s.client_ip) + '</td>' +
     '</tr>').join('');
   $('sessions').querySelector('tbody').innerHTML =
     rows || '<tr><td colspan="12" class="muted">no sessions</td></tr>';
 
   const urows = d.unknown.map((u) => '<tr>' +
-    '<td>' + esc(u.id) + '</td>' +
-    '<td>' + esc(u.method) + '</td>' +
-    '<td>' + esc(u.target_url) + '</td>' +
-    '<td>' + u.requests + '</td>' +
-    '<td>' + u.last_activity_seconds_ago + '</td>' +
+    '<td class="wrap">' + esc(u.id) + '</td>' +
+    '<td class="nw">' + esc(u.method) + '</td>' +
+    '<td class="wrap">' + esc(u.target_url) + '</td>' +
+    '<td class="nw">' + u.requests + '</td>' +
+    '<td class="nw">' + u.last_activity_seconds_ago + '</td>' +
     '</tr>').join('');
   $('unknown').querySelector('tbody').innerHTML =
     urows || '<tr><td colspan="5" class="muted">none</td></tr>';

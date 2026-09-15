@@ -255,6 +255,21 @@ async def main():
         any(u0["target_url"] == f"http://127.0.0.1:{TARGET_PORT}/custom/thing" for u0 in u),
         str(u),
     )
+    long_ua = "very-long-agent/" + "x" * 400
+    r = await client.get("/custom/long/" + "y" * 120, headers={"User-Agent": long_ua})
+    check("T6c long UA + long path proxied", r.status_code == 200, str(r.status_code))
+    d = await monitor()
+    u = d["unknown"]
+    check(
+        "T6d long UA + long path listed",
+        any("x" * 100 in u0["id"] and "y" * 100 in u0["target_url"] for u0 in u),
+        str(u)[:400],
+    )
+    page = (await client.get("/monitor")).text
+    check(
+        "T6e monitor page has overflow guard + wrap cells",
+        'class="tablewrap"' in page and "td.wrap" in page and "td.nw" in page,
+    )
 
     print("== T7: block policy + queue timeout (proxy2) ==")
     client2 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY2_PORT}", timeout=30)
