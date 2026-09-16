@@ -23,6 +23,13 @@ Within a session, CONCURRENT_SESSION_REQUESTS bounds in-flight requests
 (-1 unlimited, 0 strictly serialized). The waiting queue itself is a plain
 global FIFO: an entry is promoted when its session may run (spot available
 or already held, per-session cap not hit).
+
+Request mode (atomic_requests):
+- parallel (default): spot-holding sessions run their in-flight requests
+  concurrently;
+- atomic: at most one in-flight request globally at any moment. Spots still
+  overlap (each session keeps its K/V cache warm), but requests alternate:
+  a waiting entry is only promoted while no request anywhere is in flight.
 """
 
 import asyncio
@@ -81,12 +88,16 @@ class SessionQueue:
         max_inflight_per_session: int,
         busy_window: float,
         session_expiry: float,
+        atomic_requests: bool = False,
     ):
         self.max_spots = max(1, max_spots)
         # -1 = unlimited per-session concurrency, 0 = serialized.
         self.max_inflight_per_session = max_inflight_per_session
         self.busy_window = busy_window
         self.session_expiry = session_expiry
+        # atomic: admit at most one in-flight request globally at a time.
+        self.atomic_requests = atomic_requests
+        self.inflight_total = 0
         self.sessions: dict[tuple, Session] = {}
         # spot-holding sessions, keyed by session key; dict order is the
         # order in which spots were acquired (used for monitor ordering).
@@ -137,6 +148,9 @@ class SessionQueue:
         self._try_promote()
 
     def _eligible(self, entry: QueueEntry) -> bool:
+        # atomic mode: nothing runs while any request anywhere is in flight.
+        if self.atomic_requests and self.inflight_total > 0:
+            return False
         session = entry.session
         if session.key in self.spots:
             cap = self.max_inflight_per_session
@@ -168,6 +182,7 @@ class SessionQueue:
             session = target.session
             session.waiting -= 1
             session.inflight += 1
+            self.inflight_total += 1
             session.idle_since = None
             if session.key not in self.spots:
                 self.spots[session.key] = now
@@ -214,6 +229,7 @@ class SessionQueue:
         session = entry.session
         if session.inflight > 0:
             session.inflight -= 1
+            self.inflight_total = max(0, self.inflight_total - 1)
         session.last_request_at = time.monotonic()
         self._try_promote()
 

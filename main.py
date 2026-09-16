@@ -72,6 +72,15 @@ SESSION_ID_HEADERS = tuple(
     for h in os.getenv("SESSION_ID_HEADERS", "x-session-id").split(",")
     if h.strip()
 )
+# How spot-holding sessions share the model:
+#   parallel (default): every spot-holding session may run its in-flight
+#     requests at the same time (up to CONCURRENT_SESSION_REQUESTS each);
+#   atomic: at most ONE in-flight request globally at any moment - the
+#     sessions (and their spots, protecting each K/V cache) may overlap,
+#     but the requests themselves alternate in FIFO order.
+REQUEST_MODE = os.getenv("REQUEST_MODE", "parallel").strip().lower()
+if REQUEST_MODE not in ("parallel", "atomic"):
+    REQUEST_MODE = "parallel"
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
@@ -105,6 +114,7 @@ queue = SessionQueue(
     max_inflight_per_session=CONCURRENT_SESSION_REQUESTS,
     busy_window=CLIENT_BUSY_WINDOW,
     session_expiry=SESSION_EXPIRY,
+    atomic_requests=(REQUEST_MODE == "atomic"),
 )
 unknown_tracker = UnknownTracker()
 status_poller: StatusPoller = None
@@ -112,6 +122,7 @@ status_poller: StatusPoller = None
 PROXY_CONFIG = {
     "concurrent_sessions": CONCURRENT_SESSIONS,
     "concurrent_session_requests": CONCURRENT_SESSION_REQUESTS,
+    "request_mode": REQUEST_MODE,
     "unknown_api_policy": UNKNOWN_API_POLICY,
     "session_expiry": SESSION_EXPIRY,
     "client_busy_window": CLIENT_BUSY_WINDOW,

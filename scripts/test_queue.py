@@ -4,7 +4,7 @@ Local integration test for the session queue.
 Spawns (all on 127.0.0.1, non-default ports, no docker, no real hardware):
   - a mock LLM target            (port 8100)
   - a mock opencode status server (port 8101)
-  - the proxy under test         (port 8123, + 8124/8125 for alternate config)
+  - the proxy under test         (port 8123, + 8124-8127 for alternate config)
 
 Run:  venv/bin/python scripts/test_queue.py
 """
@@ -24,7 +24,7 @@ LOGDIR = "/tmp/opencode/proxy-test"
 os.makedirs(LOGDIR, exist_ok=True)
 
 TARGET_PORT, STATUS_PORT = 8100, 8101
-PROXY_PORT, PROXY2_PORT, PROXY3_PORT = 8123, 8124, 8125
+PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT = 8123, 8124, 8125, 8126, 8127
 
 BASE_ENV = {
     # Fake BMC: power-on attempts fail fast with connection refused and can
@@ -128,7 +128,8 @@ async def main():
     # In SKIP_PROXY mode the proxies run externally (e.g. docker), so only
     # the mock ports need to be free.
     ports = [TARGET_PORT, STATUS_PORT] if skip_proxy else [
-        TARGET_PORT, STATUS_PORT, PROXY_PORT, PROXY2_PORT, PROXY3_PORT
+        TARGET_PORT, STATUS_PORT, PROXY_PORT, PROXY2_PORT, PROXY3_PORT,
+        PROXY4_PORT, PROXY5_PORT,
     ]
     check_ports_free(ports)
     print("== spawning mocks ==")
@@ -152,9 +153,21 @@ async def main():
             [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY3_PORT)],
             {**BASE_ENV, "CONCURRENT_SESSION_REQUESTS": "0"},
         )
+        spawn(
+            "proxy4",
+            [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY4_PORT)],
+            {**BASE_ENV, "CONCURRENT_SESSIONS": "2", "REQUEST_MODE": "atomic"},
+        )
+        spawn(
+            "proxy5",
+            [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY5_PORT)],
+            {**BASE_ENV, "CONCURRENT_SESSIONS": "2"},
+        )
     await wait_http(f"http://127.0.0.1:{PROXY_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY2_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY3_PORT}/monitor/data")
+    await wait_http(f"http://127.0.0.1:{PROXY4_PORT}/monitor/data")
+    await wait_http(f"http://127.0.0.1:{PROXY5_PORT}/monitor/data")
 
     client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY_PORT}", timeout=30)
 
@@ -366,9 +379,50 @@ async def main():
     d = await monitor()
     check("T13d idle report releases the X-Session-Id session", find_session(d, "ses-O") is None)
 
+    print("== T14: atomic mode - 2 spots but at most one in-flight at a time ==")
+    client4 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY4_PORT}", timeout=30)
+    p1 = asyncio.create_task(client4.post(CHAT, json=BODY, headers={"x-session-id": "ses-P"}))
+    await asyncio.sleep(0.5)
+    q1 = asyncio.create_task(client4.post(CHAT, json=BODY, headers={"x-session-id": "ses-Q"}))
+    await asyncio.sleep(0.5)
+    p2 = asyncio.create_task(client4.post(CHAT, json=BODY, headers={"x-session-id": "ses-P"}))
+    await asyncio.sleep(0.5)
+    d = await monitor(PROXY4_PORT)
+    sp, sq = find_session(d, "ses-P"), find_session(d, "ses-Q")
+    check("T14a Q queued despite a free spot (atomic: one in-flight max)", sq is not None and sq["waiting"] == 1 and sq["queue_position"] == 1 and sq["spot"] == "none", str(sq))
+    check("T14b P's 2nd request queued despite P holding a spot", sp is not None and sp["inflight"] == 1 and sp["waiting"] == 1 and sp["queue_position"] == 2, str(sp))
+    t_p2 = time.monotonic()
+    resp_q = await q1
+    t_q_done = time.monotonic()
+    resp_p2 = await p2
+    t_p2_done = time.monotonic()
+    await p1
+    check("T14c Q's request ran before P's 2nd (FIFO alternation)", resp_q.status_code == 200 and resp_p2.status_code == 200 and t_q_done < t_p2_done, f"q {t_q_done:.1f} p2 {t_p2_done:.1f}")
+    check("T14d P's 2nd waited out both P1 and Q1", resp_p2.status_code == 200 and (t_p2_done - t_p2) > 3, f"waited {t_p2_done - t_p2:.1f}s")
+    await asyncio.sleep(7)
+    d = await monitor(PROXY4_PORT)
+    check("T14e all spots released after idle expiry", len(d["sessions"]) == 0, str(d["sessions"]))
+
+    print("== T15: parallel mode (default) - 2 spots run concurrently ==")
+    client5 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY5_PORT}", timeout=30)
+    r1 = asyncio.create_task(client5.post(CHAT, json=BODY, headers={"x-session-id": "ses-R"}))
+    await asyncio.sleep(0.5)
+    s1 = asyncio.create_task(client5.post(CHAT, json=BODY, headers={"x-session-id": "ses-S"}))
+    await asyncio.sleep(1.0)
+    s2 = asyncio.create_task(client5.post(CHAT, json=BODY, headers={"x-session-id": "ses-S"}))
+    await asyncio.sleep(0.3)
+    d = await monitor(PROXY5_PORT)
+    sr, ss = find_session(d, "ses-R"), find_session(d, "ses-S")
+    check("T15a S has 2 in-flight at once (parallel)", ss is not None and ss["inflight"] == 2 and ss["spot"] == "held", str(ss))
+    check("T15b both sessions hold spots at the same time", sr is not None and sr["inflight"] == 1 and sr["spot"] == "held", f"{sr} / {ss}")
+    await r1, await s1, await s2
+    await asyncio.sleep(7)
+
     await client.aclose()
     await client2.aclose()
     await client3.aclose()
+    await client4.aclose()
+    await client5.aclose()
 
     print()
     failed = [n for n, ok in results if not ok]
