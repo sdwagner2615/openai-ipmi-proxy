@@ -102,6 +102,14 @@ def mock_set(status_sid, status_type):
     )
 
 
+def mock_parent(sid, parent):
+    return httpx.post(
+        f"http://127.0.0.1:{STATUS_PORT}/parent",
+        params={"sid": sid, "parent": parent},
+        timeout=3,
+    )
+
+
 def check(name, cond, extra=""):
     results.append((name, bool(cond)))
     print(f"  {'PASS' if cond else 'FAIL'}: {name}" + (f"  [{extra}]" if extra and not cond else ""))
@@ -416,6 +424,37 @@ async def main():
     check("T15a S has 2 in-flight at once (parallel)", ss is not None and ss["inflight"] == 2 and ss["spot"] == "held", str(ss))
     check("T15b both sessions hold spots at the same time", sr is not None and sr["inflight"] == 1 and sr["spot"] == "held", f"{sr} / {ss}")
     await r1, await s1, await s2
+    await asyncio.sleep(7)
+
+    print("== T16: sub-agent shares the parent's spot ==")
+    mock_set("ses-PP", "busy")
+    ppr = await client.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-PP"})
+    check("T16a parent running, holding the only spot", ppr.status_code == 200, ppr.text[:120])
+    d = await monitor()
+    sp = find_session(d, "ses-PP")
+    check("T16b parent holds the spot (client busy)", sp is not None and sp["spot"] == "held" and d["config"]["active_sessions"] == 1, str(sp))
+    mock_parent("ses-PC", "ses-PP")
+    t0 = time.monotonic()
+    pcr = asyncio.create_task(client.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-PC"}))
+    await asyncio.sleep(1.5)
+    d = await monitor()
+    sp, sc = find_session(d, "ses-PP"), find_session(d, "ses-PC")
+    check("T16c child listed on the parent's spot (shared)", sp is not None and sp["spot"] == "held" and sc is not None and sc["spot"] == "shared" and (sc["inflight"] + sc["waiting"]) >= 1, f"{sp} / {sc}")
+    check("T16d still only one spot in use overall", d["config"]["active_sessions"] == 1, str(d["config"]["active_sessions"]))
+    resp_c = await pcr
+    wait_s = time.monotonic() - t0
+    check("T16e child ran without waiting for its own spot", resp_c.status_code == 200 and wait_s < 5, f"{wait_s:.1f}s")
+    mock_set("ses-PC", "busy")
+    mock_set("ses-PP", "idle")
+    await asyncio.sleep(7)
+    d = await monitor()
+    check("T16f parent spot released after idle", find_session(d, "ses-PP") is None)
+    pcr2 = await client.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-PC"})
+    check("T16g child request ok after parent release", pcr2.status_code == 200, pcr2.text[:120])
+    d = await monitor()
+    sc = find_session(d, "ses-PC")
+    check("T16h child now holds a spot of its own", sc is not None and sc["spot"] == "held", str(sc))
+    mock_set("ses-PC", "idle")
     await asyncio.sleep(7)
 
     await client.aclose()

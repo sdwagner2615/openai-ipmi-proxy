@@ -4,8 +4,11 @@ Mock OpenCode status server for local proxy tests.
 Models the real opencode server's per-directory (per-instance) behavior:
   GET  /session/status?directory=<dir> -> {sid: {"type": ...}}
                                             ({} unless directory matches)
-  GET  /session/{sid}                   -> {"id": sid, "directory": <dir>}
+  GET  /session/{sid}                   -> {"id": sid, "directory": <dir>,
+                                            "parentID": <p> (if sub-agent)}
   POST /set?sid=X&type=busy|idle|retry  -> set a session's status
+  POST /parent?sid=X&parent=Y           -> mark X a sub-agent of Y
+  DELETE /parent?sid=X                  -> clear X's parent
 
 Env: MOCK_STATUS_PORT (default 8101), MOCK_STATUS_DIR (default "mock-dir")
 """
@@ -20,6 +23,7 @@ MOCK_DIR = os.getenv("MOCK_STATUS_DIR", "mock-dir")
 
 app = FastAPI()
 statuses: dict = {}
+parents: dict = {}
 
 
 @app.get("/session/status")
@@ -36,7 +40,23 @@ async def session_status(directory: str = Query(default="")):
 async def session_info(session_id: str):
     # The real server resolves sessions across instances without a
     # directory parameter and reports the session's working directory.
-    return {"id": session_id, "directory": MOCK_DIR}
+    # Sub-agent sessions additionally carry a parentID.
+    info = {"id": session_id, "directory": MOCK_DIR}
+    if session_id in parents:
+        info["parentID"] = parents[session_id]
+    return info
+
+
+@app.post("/parent")
+async def set_parent(sid: str = Query(...), parent: str = Query(...)):
+    parents[sid] = parent
+    return parents
+
+
+@app.delete("/parent")
+async def delete_parent(sid: str = Query(...)):
+    parents.pop(sid, None)
+    return parents
 
 
 @app.post("/set")

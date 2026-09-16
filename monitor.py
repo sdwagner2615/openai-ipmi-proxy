@@ -52,6 +52,7 @@ HTML_PAGE = """<!doctype html>
   .status { font-weight: bold; }
   .busy { color: #6cf; } .queued { color: #fc6; } .idle { color: #9c9; }
   .retry { color: #f77; }
+  .shared-spot { color: #c9f; font-weight: bold; }
   .muted { color: #666; font-weight: normal; }
   button.release { font-family: inherit; font-size: .72rem; background: #232323;
                    color: #fc6; border: 1px solid #665c33; border-radius: 3px;
@@ -102,7 +103,8 @@ function render(d) {
     '<td class="nw">' + esc(s.api) + '</td>' +
     '<td class="status nw ' + s.status + '">' + esc(s.status) +
       (s.detail ? ' <span class="muted">' + esc(s.detail) + '</span>' : '') + '</td>' +
-    '<td class="nw">' + s.spot + (s.spot === 'held'
+    '<td class="nw">' + (s.spot === 'shared' ? '<span class="shared-spot">shared</span>' : s.spot)
+      + (s.spot === 'held'
       ? ' <button class="release" data-client="' + esc(s.client) +
         '" data-session="' + esc(s.session) +
         '" title="Release this spot now (before the idle timeout)">release</button>'

@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from apis import detect_api, session_id_from_body
 from clients import detect_client, session_header_value, StatusPoller
@@ -287,6 +288,40 @@ def resolve_session_id(request: Request, body: bytes) -> tuple:
     return "unknown", f"ua:{user_agent}|ip:{client_ip}"
 
 
+def resolve_shared_spot(base: str, session_id: str) -> Optional[tuple]:
+    """
+    Sub-agent spot sharing: walks the cached opencode parentID chain of a
+    session and returns the queue key of the spot it may run on - the spot
+    of the closest tracked ancestor (an ancestor that made requests through
+    the proxy). If that ancestor is itself a sub-agent, the spot it shares
+    is returned instead. None means no sharing: the session needs a spot of
+    its own. Recomputed on every poll; no network I/O (the cache is filled
+    by the status poller).
+    """
+    current = session_id
+    seen = {current}
+    for _ in range(10):  # depth cap; real sub-agent chains are 1-2 levels
+        key = (base, current)
+        if key not in status_poller.session_parent:
+            return None  # chain not resolved yet; retried next poll
+        parent = status_poller.session_parent[key]
+        if not parent or parent in seen:
+            return None
+        seen.add(parent)
+        ancestor = queue.sessions.get(("opencode", parent))
+        if ancestor is not None:
+            if ancestor.key in queue.spots:
+                return ancestor.key
+            if (
+                ancestor.shared_spot_key is not None
+                and ancestor.shared_spot_key in queue.spots
+            ):
+                return ancestor.shared_spot_key
+            return ancestor.key
+        current = parent
+    return None
+
+
 async def forward_request(
     request: Request, path: str, body: bytes = None, entry: QueueEntry = None
 ):
@@ -422,13 +457,19 @@ async def queue_manager():
                 key = (base, session.session_id)
                 directory = status_poller.session_dir.get(key)
                 if directory is None:
-                    directory = await status_poller.fetch_session_dir(
+                    info = await status_poller.fetch_session_info(
                         base, session.session_id
                     )
-                    if directory is None:
+                    if info is None:
                         continue
+                    directory, parent_id = info
                     status_poller.session_dir[key] = directory
+                    status_poller.session_parent[key] = parent_id
                 by_dir.setdefault(directory, []).append(session)
+                # Sub-agent spot sharing: a session runs on the spot of its
+                # tracked ancestor (recomputed every poll - the ancestor's
+                # spot state changes over time).
+                session.shared_spot_key = resolve_shared_spot(base, session.session_id)
             for directory, dir_sessions in by_dir.items():
                 data = await status_poller.fetch_statuses(base, directory)
                 if data is None:

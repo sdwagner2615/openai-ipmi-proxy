@@ -25,6 +25,11 @@ directory), so the session's directory is resolved first via
 GET /session/{id} (which works without a directory and returns it) and the
 status is then polled with GET /session/status?directory=<dir>.
 
+Sub-agents: opencode's task tool creates sub-agent sessions that carry a
+"parentID" pointing at the session that spawned them (also returned by
+GET /session/{id}). The proxy uses this to let a sub-agent share the spot
+of its tracked ancestor instead of waiting for one of its own.
+
 Discovery: the proxy probes <client-source-IP>:<OPENCODE_STATUS_PORT>.
 The client must therefore run its opencode server on a reachable interface
 (e.g. "opencode serve --hostname 0.0.0.0 --port 4096"); the TUI default
@@ -137,6 +142,8 @@ class StatusPoller:
         # (base, session-id) -> working directory; a session's directory
         # never changes, so entries live until the session is gone.
         self.session_dir: dict[tuple, str] = {}
+        # (base, session-id) -> parent session id (None = not a sub-agent).
+        self.session_parent: dict[tuple, Optional[str]] = {}
 
     def base_url(self, client_ip: str) -> str:
         return f"http://{client_ip}:{self.port}"
@@ -146,12 +153,15 @@ class StatusPoller:
 
     def forget(self, base: str, session_id: str) -> None:
         self.session_dir.pop((base, session_id), None)
+        self.session_parent.pop((base, session_id), None)
 
-    async def fetch_session_dir(self, base: str, session_id: str) -> Optional[str]:
+    async def fetch_session_info(self, base: str, session_id: str) -> Optional[tuple]:
         """
-        Resolves a session's working directory via GET /session/{id}.
-        Returns None when the session is unknown or the client is
-        unreachable (callers skip that session until the next poll).
+        Resolves a session's (working directory, parent session id) via
+        GET /session/{id}. The parent id is None for regular sessions and
+        set for sub-agent sessions (opencode's task tool). Returns None
+        when the session is unknown or the client is unreachable (callers
+        skip that session until the next poll).
         """
         url = f"{base}{OPENCODE.session_path}/{quote(session_id, safe='')}"
         try:
@@ -162,9 +172,10 @@ class StatusPoller:
                 logger.debug("Session lookup %s: HTTP %s", url, response.status_code)
                 return None
             data = response.json()
-            if isinstance(data, dict) and isinstance(data.get("directory"), str):
-                return data["directory"] or None
-            return None
+            if not isinstance(data, dict) or not isinstance(data.get("directory"), str) or not data["directory"]:
+                return None
+            parent = data.get("parentID")
+            return data["directory"], (parent if isinstance(parent, str) and parent else None)
         except Exception as e:
             logger.debug("Session lookup %s failed: %s", url, e)
             return None

@@ -30,6 +30,13 @@ Request mode (atomic_requests):
 - atomic: at most one in-flight request globally at any moment. Spots still
   overlap (each session keeps its K/V cache warm), but requests alternate:
   a waiting entry is only promoted while no request anywhere is in flight.
+
+Sub-agent spot sharing: a session whose opencode parentID chain leads to a
+tracked session can run on that ancestor's spot (shared_spot_key) instead
+of holding one of its own - a sub-agent is part of its parent's turn, so it
+needs no separate slot. Sharing is checked dynamically: if the ancestor's
+spot is released, the child simply stops sharing and queues like any other
+session. Sharing never takes a spot from another session.
 """
 
 import asyncio
@@ -60,6 +67,9 @@ class Session:
     waiting: int = 0
     spot_held: bool = False
     spot_acquired_at: float = 0.0
+    # Sub-agent spot sharing: the queue key of the tracked ancestor whose
+    # spot this session runs on (None when it holds its own spot or none).
+    shared_spot_key: Optional[tuple] = None
     idle_since: Optional[float] = None
     # Last state reported by the client's status API (known clients only).
     client_status: Optional[str] = None
@@ -147,12 +157,25 @@ class SessionQueue:
         self.queue.append(entry)
         self._try_promote()
 
+    def _spot_key(self, session: Session) -> Optional[tuple]:
+        """
+        The spot this session runs on: its own, or - for a sub-agent - the
+        spot of the tracked ancestor it is sharing. None when the session
+        has no spot to run on.
+        """
+        if session.key in self.spots:
+            return session.key
+        shared = session.shared_spot_key
+        if shared is not None and shared in self.spots:
+            return shared
+        return None
+
     def _eligible(self, entry: QueueEntry) -> bool:
         # atomic mode: nothing runs while any request anywhere is in flight.
         if self.atomic_requests and self.inflight_total > 0:
             return False
         session = entry.session
-        if session.key in self.spots:
+        if self._spot_key(session) is not None:
             cap = self.max_inflight_per_session
             if cap < 0:
                 return True
@@ -184,7 +207,9 @@ class SessionQueue:
             session.inflight += 1
             self.inflight_total += 1
             session.idle_since = None
-            if session.key not in self.spots:
+            # A sub-agent running on a shared spot acquires no spot of its
+            # own (that would let more sessions run than CONCURRENT_SESSIONS).
+            if self._spot_key(session) is None:
                 self.spots[session.key] = now
                 session.spot_held = True
                 session.spot_acquired_at = now
@@ -345,10 +370,24 @@ class SessionQueue:
             session = self.sessions.get(key)
             if session is not None and all(s is not session for s in ordered):
                 ordered.append(session)
+        # Sub-agents running on a shared spot hold no spot of their own and
+        # may have nothing waiting - they are still active and must be listed.
+        for key, session in list(self.sessions.items()):
+            if (
+                session.shared_spot_key is not None
+                and session.shared_spot_key in self.spots
+                and all(s is not session for s in ordered)
+            ):
+                ordered.append(session)
 
         rows = []
         for idx, session in enumerate(ordered, start=1):
             releases_in = None
+            spot = "none"
+            if session.key in self.spots:
+                spot = "held"
+            elif session.shared_spot_key is not None and session.shared_spot_key in self.spots:
+                spot = "shared"
             if session.spot_held:
                 deadline = self._release_deadline(session)
                 if deadline is not None:
@@ -361,7 +400,7 @@ class SessionQueue:
                     "api": session.api,
                     "status": session.status,
                     "detail": session.status_detail,
-                    "spot": "held" if session.spot_held else "none",
+                    "spot": spot,
                     "spot_releases_in": releases_in,
                     "inflight": session.inflight,
                     "waiting": session.waiting,
