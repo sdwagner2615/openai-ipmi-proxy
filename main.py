@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
 from apis import detect_api, session_id_from_body
-from clients import detect_client, StatusPoller
+from clients import detect_client, session_header_value, StatusPoller
 from session_queue import SessionQueue, QueueEntry, UnknownTracker
 from monitor import build_data, HTML_PAGE
 
@@ -248,7 +248,9 @@ def resolve_session_id(request: Request, body: bytes) -> tuple:
     where client_name is a known client ("opencode") or "unknown".
 
     Precedence:
-      1. a known client's own session header (x-opencode-session),
+      1. a known client's own session headers (for OpenCode:
+         x-opencode-session, or X-Session-Id / x-session-affinity when the
+         client is not using OpenCode's hosted provider),
       2. a generic configured header (SESSION_ID_HEADERS),
       3. the API-native body field (OpenAI "user", Anthropic
          "metadata.user_id"),
@@ -259,8 +261,10 @@ def resolve_session_id(request: Request, body: bytes) -> tuple:
     user_agent = lowered.get("user-agent", "")
 
     provider = detect_client(lowered)
-    if provider is not None and lowered.get(provider.session_header):
-        return provider.name, lowered[provider.session_header]
+    if provider is not None:
+        value = session_header_value(provider, lowered)
+        if value:
+            return provider.name, value
     for header in SESSION_ID_HEADERS:
         value = lowered.get(header)
         if value:
@@ -397,24 +401,44 @@ async def queue_manager():
         for base, sessions in bases.items():
             if not status_poller.due(base, now):
                 continue
-            data = await status_poller.fetch(base)
-            status_poller.last_poll[base] = time.monotonic()
-            if data is None:
-                # Unreachable: tick() keeps each session's last-known status
-                # for the grace period, then treats it as idle.
-                continue
+            # The status map is per-directory (one opencode "instance" per
+            # working directory), so first resolve each session's directory
+            # (GET /session/{id}, cached) and then poll one map per
+            # directory. Unreachable lookups are skipped; tick() keeps each
+            # session's last-known status for the grace period.
+            by_dir: dict[str, list] = {}
             for session in sessions:
-                st = data.get(session.session_id)
-                if not isinstance(st, dict):
+                key = (base, session.session_id)
+                directory = status_poller.session_dir.get(key)
+                if directory is None:
+                    directory = await status_poller.fetch_session_dir(
+                        base, session.session_id
+                    )
+                    if directory is None:
+                        continue
+                    status_poller.session_dir[key] = directory
+                by_dir.setdefault(directory, []).append(session)
+            for directory, dir_sessions in by_dir.items():
+                data = await status_poller.fetch_statuses(base, directory)
+                if data is None:
                     continue
-                stype = st.get("type")
-                if stype not in ("busy", "idle", "retry"):
-                    continue
-                session.client_status = stype
-                session.client_status_at = time.monotonic()
-                session.client_status_detail = (
-                    f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
-                )
+                for session in dir_sessions:
+                    st = data.get(session.session_id)
+                    if not isinstance(st, dict):
+                        continue
+                    stype = st.get("type")
+                    if stype not in ("busy", "idle", "retry"):
+                        continue
+                    session.client_status = stype
+                    session.client_status_at = time.monotonic()
+                    session.client_status_detail = (
+                        f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
+                    )
+            status_poller.last_poll[base] = time.monotonic()
+            # Forget directory cache entries of sessions that are gone.
+            live = {s.session_id for s in sessions}
+            for key in [k for k in status_poller.session_dir if k[0] == base and k[1] not in live]:
+                status_poller.forget(key[0], key[1])
 
         # 2) Status recompute + spot surrender.
         for key in queue.tick(now):
@@ -489,6 +513,31 @@ async def monitor_data():
     """JSON snapshot of configuration, sessions and unknown-API activity."""
     config = {**PROXY_CONFIG, "target_server_url": TARGET_SERVER_URL}
     return JSONResponse(build_data(queue, unknown_tracker, config, state))
+
+
+@app.post("/monitor/release")
+async def monitor_release(request: Request):
+    """
+    Manually releases a session's spot before SESSION_EXPIRY elapses
+    (backed by the "release" button on the monitor page).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+    client = data.get("client")
+    session_id = data.get("session")
+    if not client or not session_id:
+        return JSONResponse(status_code=400, content={"error": "Both 'client' and 'session' are required."})
+    if not queue.release_session(str(client), str(session_id)):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Session '{session_id}' ({client}) holds no spot."},
+        )
+    logger.info(f"Spot manually released for session {session_id} ({client}).")
+    return JSONResponse({"released": True})
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

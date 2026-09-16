@@ -190,6 +190,21 @@ class SessionQueue:
         """Drops a waiting entry (client disconnected or queue timeout)."""
         self._remove_waiting(entry)
 
+    def release_session(self, client: str, session_id: str) -> bool:
+        """
+        Manually surrenders a session's spot right now (same effect as
+        SESSION_EXPIRY elapsing): the spot is freed for the next waiting
+        session and the session is forgotten, so future requests with the
+        same id queue at the back as a new session. Returns True when a
+        spot was actually released.
+        """
+        key = (client, session_id)
+        session = self.sessions.get(key)
+        if session is None or not session.spot_held:
+            return False
+        self._release_spot(session, key)
+        return True
+
     def release(self, entry: QueueEntry, status_code: Optional[int]) -> None:
         """
         Called exactly once when an in-flight request finishes (the

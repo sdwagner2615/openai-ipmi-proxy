@@ -6,13 +6,24 @@ Queuing needs to know when a session is truly done with the model (not just
 long tool call and we want to keep its K/V cache warm by holding its spot.
 
 Known clients can therefore report their own session state over an external
-API. OpenCode is the first such client: every LLM request it makes carries
-an "x-opencode-session" header (per-conversation id), and its local server
-exposes GET /session/status returning
+API. OpenCode is the first such client. Its local server exposes
+GET /session/status returning
     { <sessionID>: {"type": "busy"} | {"type": "idle"}
         | {"type": "retry", "attempt", "message", "next"} }
 "busy" is held for the whole turn, including tool execution, which is
 exactly the window we want to protect.
+
+Session identification: opencode only sends the "x-opencode-session" header
+when talking to OpenCode's own hosted provider; for every other provider
+(e.g. a self-hosted llama.cpp server) it sends "X-Session-Id" (and
+"x-session-affinity") instead. Both are checked, gated on the opencode
+User-Agent, so other tools that happen to send an X-Session-Id header are
+not misattributed.
+
+The status map is per-directory (one opencode "instance" per working
+directory), so the session's directory is resolved first via
+GET /session/{id} (which works without a directory and returns it) and the
+status is then polled with GET /session/status?directory=<dir>.
 
 Discovery: the proxy probes <client-source-IP>:<OPENCODE_STATUS_PORT>.
 The client must therefore run its opencode server on a reachable interface
@@ -23,6 +34,7 @@ The client must therefore run its opencode server on a reachable interface
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -39,17 +51,30 @@ STATUS_UNREACHABLE_GRACE = 30.0
 @dataclass(frozen=True)
 class ClientProvider:
     name: str
-    # Header whose presence identifies this client and whose value is the
-    # session id.
-    session_header: str
-    # Path on the client's local server that reports all session statuses.
-    status_path: str
+    # Headers that identify this client on their own (uniquely owned by the
+    # client; checked in order, first present carries the session id).
+    session_headers: tuple
+    # Headers that identify this client only when the User-Agent matches
+    # ua_prefix (these are generic headers other tools may send too).
+    gated_session_headers: tuple = ()
+    # UA prefix required for the gated headers to count.
+    ua_prefix: str = ""
+    # Path on the client's local server that reports session statuses.
+    status_path: str = "/session/status"
+    # Path on the client's local server that returns a single session
+    # (used to resolve its directory).
+    session_path: str = "/session"
 
 
 OPENCODE = ClientProvider(
     name="opencode",
-    session_header="x-opencode-session",
-    status_path="/session/status",
+    # Only sent when using OpenCode's own hosted provider.
+    session_headers=("x-opencode-session",),
+    # Sent for every other provider (e.g. llama.cpp); gated on the
+    # opencode User-Agent so other tools using the same headers are not
+    # misattributed.
+    gated_session_headers=("x-session-affinity", "x-session-id"),
+    ua_prefix="opencode/",
 )
 
 CLIENT_PROVIDERS: tuple[ClientProvider, ...] = (OPENCODE,)
@@ -61,18 +86,36 @@ def detect_client(headers: dict) -> Optional[ClientProvider]:
     None for clients without a known provider.
     """
     lowered = {k.lower(): v for k, v in headers.items()}
+    ua = lowered.get("user-agent", "").lower()
     for provider in CLIENT_PROVIDERS:
-        if provider.session_header in lowered:
+        if any(lowered.get(h) for h in provider.session_headers):
             return provider
+        if (
+            provider.ua_prefix
+            and ua.startswith(provider.ua_prefix)
+            and any(lowered.get(h) for h in provider.gated_session_headers)
+        ):
+            return provider
+    return None
+
+
+def session_header_value(provider: ClientProvider, headers: dict) -> Optional[str]:
+    """The first non-empty session header value for a provider, else None."""
+    lowered = {k.lower(): v for k, v in headers.items()}
+    for header in provider.session_headers + provider.gated_session_headers:
+        value = lowered.get(header)
+        if value:
+            return value
     return None
 
 
 class StatusPoller:
     """
     Polls known clients' status APIs. One base URL per client machine
-    (derived from the client's source IP); a single GET returns the status
-    of every session on that machine, so polling cost stays at one request
-    per client per interval no matter how many sessions it has.
+    (derived from the client's source IP). Because the status map is
+    per-directory, each session's directory is resolved once (GET
+    /session/{id}) and cached; one status GET is then made per distinct
+    directory per poll interval.
     """
 
     def __init__(
@@ -91,6 +134,9 @@ class StatusPoller:
         # use the fixed username "opencode".
         self.auth = ("opencode", password) if password else None
         self.last_poll: dict[str, float] = {}
+        # (base, session-id) -> working directory; a session's directory
+        # never changes, so entries live until the session is gone.
+        self.session_dir: dict[tuple, str] = {}
 
     def base_url(self, client_ip: str) -> str:
         return f"http://{client_ip}:{self.port}"
@@ -98,17 +144,43 @@ class StatusPoller:
     def due(self, base: str, now: float) -> bool:
         return now - self.last_poll.get(base, 0.0) >= self.poll_interval
 
-    async def fetch(self, base: str) -> Optional[dict]:
+    def forget(self, base: str, session_id: str) -> None:
+        self.session_dir.pop((base, session_id), None)
+
+    async def fetch_session_dir(self, base: str, session_id: str) -> Optional[str]:
         """
-        GETs the status map for one client base. Returns a dict of
-        session-id -> status-object, or None when the client is unreachable
-        or answers with garbage (callers keep last-known state in that case).
-        The caller records last_poll[base] after the call.
+        Resolves a session's working directory via GET /session/{id}.
+        Returns None when the session is unknown or the client is
+        unreachable (callers skip that session until the next poll).
         """
-        url = base + OPENCODE.status_path
+        url = f"{base}{OPENCODE.session_path}/{quote(session_id, safe='')}"
         try:
             response = await self.http_client.get(
                 url, timeout=self.timeout, auth=self.auth
+            )
+            if response.status_code != 200:
+                logger.debug("Session lookup %s: HTTP %s", url, response.status_code)
+                return None
+            data = response.json()
+            if isinstance(data, dict) and isinstance(data.get("directory"), str):
+                return data["directory"] or None
+            return None
+        except Exception as e:
+            logger.debug("Session lookup %s failed: %s", url, e)
+            return None
+
+    async def fetch_statuses(self, base: str, directory: Optional[str]) -> Optional[dict]:
+        """
+        GETs the status map for one client base and directory. Returns a
+        dict of session-id -> status-object, or None when the client is
+        unreachable or answers with garbage (callers keep last-known state
+        in that case). The caller records last_poll[base] after the call.
+        """
+        url = base + OPENCODE.status_path
+        params = {"directory": directory} if directory else None
+        try:
+            response = await self.http_client.get(
+                url, params=params, timeout=self.timeout, auth=self.auth
             )
             if response.status_code != 200:
                 logger.debug("Status poll %s: HTTP %s", url, response.status_code)

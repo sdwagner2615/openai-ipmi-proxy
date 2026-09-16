@@ -329,6 +329,43 @@ async def main():
     check("T11b session id from metadata.user_id, api=anthropic", sa is not None and sa["api"] == "anthropic" and sa["client"] == "unknown", str(sa))
     await asyncio.sleep(7)
 
+    print("== T12: manual spot release via /monitor/release ==")
+    mock_set("ses-K", "busy")
+    kr = await client.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-K"})
+    check("T12a K running", kr.status_code == 200, kr.text[:120])
+    lr = asyncio.create_task(client.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-L"}))
+    await asyncio.sleep(0.6)
+    d = await monitor()
+    sl = find_session(d, "ses-L")
+    check("T12b L queued while K stays client-busy", sl is not None and sl["waiting"] == 1 and sl["queue_position"] == 1, str(sl))
+    rel = await client.post("/monitor/release", json={"client": "opencode", "session": "ses-K"})
+    check("T12c release endpoint frees K's spot", rel.status_code == 200 and rel.json().get("released") is True, rel.text[:120])
+    t0 = time.monotonic()
+    resp_l = await lr
+    wait_s = time.monotonic() - t0
+    check("T12d L promoted promptly after manual release", resp_l.status_code == 200 and wait_s < 6, f"{resp_l.status_code} after {wait_s:.1f}s")
+    bad = await client.post("/monitor/release", json={"client": "opencode", "session": "ses-ghost"})
+    check("T12e releasing a non-spot-holding session -> 404", bad.status_code == 404, f"{bad.status_code} {bad.text[:120]}")
+    mock_set("ses-L", "idle")
+    await asyncio.sleep(7)
+
+    print("== T13: opencode detected via X-Session-Id (non-hosted provider) ==")
+    oc_headers = {"X-Session-Id": "ses-O", "User-Agent": "opencode/1.18.23"}
+    orr = await client.post(CHAT, json=BODY, headers=oc_headers)
+    check("T13a X-Session-Id + opencode UA request ok", orr.status_code == 200, orr.text[:200])
+    d = await monitor()
+    so = find_session(d, "ses-O")
+    check("T13b identified as client=opencode, not unknown", so is not None and so["client"] == "opencode", str(so))
+    mock_set("ses-O", "busy")
+    await asyncio.sleep(6)  # > SESSION_EXPIRY(4): per-directory poll must keep it busy
+    d = await monitor()
+    so = find_session(d, "ses-O")
+    check("T13c directory-aware poll keeps spot held (client busy)", so is not None and so["spot"] == "held" and so["status"] == "busy", str(so))
+    mock_set("ses-O", "idle")
+    await asyncio.sleep(7)
+    d = await monitor()
+    check("T13d idle report releases the X-Session-Id session", find_session(d, "ses-O") is None)
+
     await client.aclose()
     await client2.aclose()
     await client3.aclose()

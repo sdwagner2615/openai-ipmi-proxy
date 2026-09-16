@@ -53,6 +53,11 @@ HTML_PAGE = """<!doctype html>
   .busy { color: #6cf; } .queued { color: #fc6; } .idle { color: #9c9; }
   .retry { color: #f77; }
   .muted { color: #666; font-weight: normal; }
+  button.release { font-family: inherit; font-size: .72rem; background: #232323;
+                   color: #fc6; border: 1px solid #665c33; border-radius: 3px;
+                   padding: .05rem .4rem; cursor: pointer; vertical-align: middle; }
+  button.release:hover { background: #fc6; color: #111; }
+  button.release:disabled { opacity: .5; cursor: default; }
   #updated { color: #666; font-size: .8rem; font-weight: normal; }
 </style>
 </head>
@@ -97,7 +102,11 @@ function render(d) {
     '<td class="nw">' + esc(s.api) + '</td>' +
     '<td class="status nw ' + s.status + '">' + esc(s.status) +
       (s.detail ? ' <span class="muted">' + esc(s.detail) + '</span>' : '') + '</td>' +
-    '<td class="nw">' + s.spot + '</td>' +
+    '<td class="nw">' + s.spot + (s.spot === 'held'
+      ? ' <button class="release" data-client="' + esc(s.client) +
+        '" data-session="' + esc(s.session) +
+        '" title="Release this spot now (before the idle timeout)">release</button>'
+      : '') + '</td>' +
     '<td class="nw">' + (s.spot_releases_in === null ? '-' : s.spot_releases_in + 's') + '</td>' +
     '<td class="nw">' + s.inflight + '</td>' +
     '<td class="nw">' + s.waiting + '</td>' +
@@ -117,6 +126,21 @@ function render(d) {
     '</tr>').join('');
   $('unknown').querySelector('tbody').innerHTML =
     urows || '<tr><td colspan="5" class="muted">none</td></tr>';
+
+  document.querySelectorAll('button.release').forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        await fetch('/monitor/release', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ client: b.dataset.client, session: b.dataset.session }),
+        });
+      } finally {
+        refresh();
+      }
+    };
+  });
 }
 
 async function refresh() {
