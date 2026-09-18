@@ -8,10 +8,11 @@ long tool call and we want to keep its K/V cache warm by holding its spot.
 Known clients can therefore report their own session state over an external
 API. OpenCode is the first such client. Its local server exposes
 GET /session/status returning
-    { <sessionID>: {"type": "busy"} | {"type": "idle"}
-        | {"type": "retry", "attempt", "message", "next"} }
+    { <sessionID>: {"type": "busy"} | {"type": "retry", "attempt", "message", "next"} }
 "busy" is held for the whole turn, including tool execution, which is
-exactly the window we want to protect.
+exactly the window we want to protect. Note that an idle session is NOT
+present in the map at all - opencode deletes its entry the moment the
+session goes idle, so "absent from a fresh status map" is the idle report.
 
 Session identification: opencode only sends the "x-opencode-session" header
 when talking to OpenCode's own hosted provider; for every other provider
@@ -29,6 +30,12 @@ Sub-agents: opencode's task tool creates sub-agent sessions that carry a
 "parentID" pointing at the session that spawned them (also returned by
 GET /session/{id}). The proxy uses this to let a sub-agent share the spot
 of its tracked ancestor instead of waiting for one of its own.
+
+Waiting for user input: while a session is blocked mid-turn on a pending
+permission approval or a question answer, opencode keeps it "busy" in the
+status map, so the proxy also polls the client's pending-request endpoints
+(GET /permission and GET /question, both per-directory like the status
+map) and treats sessions with a pending request as "waiting for input".
 
 Discovery: the proxy probes <client-source-IP>:<OPENCODE_STATUS_PORT>.
 The client must therefore run its opencode server on a reachable interface
@@ -69,6 +76,9 @@ class ClientProvider:
     # Path on the client's local server that returns a single session
     # (used to resolve its directory).
     session_path: str = "/session"
+    # (path, kind) pairs of endpoints listing requests a session is blocked
+    # on while awaiting user input; each item carries a "sessionID".
+    pending_paths: tuple = ()
 
 
 OPENCODE = ClientProvider(
@@ -80,6 +90,10 @@ OPENCODE = ClientProvider(
     # misattributed.
     gated_session_headers=("x-session-affinity", "x-session-id"),
     ua_prefix="opencode/",
+    pending_paths=(
+        ("/permission", "permission"),
+        ("/question", "question"),
+    ),
 )
 
 CLIENT_PROVIDERS: tuple[ClientProvider, ...] = (OPENCODE,)
@@ -203,3 +217,34 @@ class StatusPoller:
         except Exception as e:
             logger.debug("Status poll %s failed: %s", url, e)
             return None
+
+    async def fetch_pending(self, base: str, directory: Optional[str]) -> Optional[dict]:
+        """
+        GETs the pending user-input endpoints (permission / question) for
+        one client base and directory. Returns {session-id: kind} for the
+        sessions currently blocked awaiting a human, or None when any of
+        the endpoints is unreachable or answers with garbage (callers keep
+        last-known state; a partial answer must never clear a session's
+        "waiting" flag).
+        """
+        params = {"directory": directory} if directory else None
+        pending: dict = {}
+        for path, kind in OPENCODE.pending_paths:
+            url = base + path
+            try:
+                response = await self.http_client.get(
+                    url, params=params, timeout=self.timeout, auth=self.auth
+                )
+                if response.status_code != 200:
+                    logger.debug("Pending poll %s: HTTP %s", url, response.status_code)
+                    return None
+                data = response.json()
+                if not isinstance(data, list):
+                    return None
+                for item in data:
+                    if isinstance(item, dict) and isinstance(item.get("sessionID"), str):
+                        pending[item["sessionID"]] = kind
+            except Exception as e:
+                logger.debug("Pending poll %s failed: %s", url, e)
+                return None
+        return pending

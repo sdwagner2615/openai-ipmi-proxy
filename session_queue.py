@@ -38,12 +38,22 @@ needs no separate slot. Sharing is checked dynamically: if the ancestor's
 spot is released, the child simply stops sharing and queues like any other
 session. Sharing never takes a spot from another session.
 
+Idle detection for known clients: OpenCode never reports a literal "idle"
+status - it REMOVES idle sessions from its status map, so a fresh poll that
+lacks a tracked session IS the client's idle report (the poller records it
+as client_status "idle"). A session blocked on user input (a pending
+permission or question) stays "busy" in that map, so the poller also checks
+the client's pending-request endpoints and records such sessions as
+client_status "waiting".
+
 Immediate idle release (immediate_idle_release): by default a known client
 keeps its spot for SESSION_EXPIRY after it goes idle, so a short gap does
-not evict its K/V cache. When enabled, a known client that truly reports
-"idle" over its status API (fresh report, not the unreachable-grace
-fallback) surrenders its spot immediately; unknown clients and inferred
-idle are unaffected.
+not evict its K/V cache. When enabled, a known client that truly reports it
+is idle (fresh report, not the unreachable-grace fallback) surrenders its
+spot immediately; unknown clients and inferred idle are unaffected. A
+fresh "waiting for input" report always releases the spot immediately
+(regardless of the flag): a blocked session will not make another model
+call until a human acts, so there is no cache to protect.
 """
 
 import asyncio
@@ -78,7 +88,10 @@ class Session:
     # spot this session runs on (None when it holds its own spot or none).
     shared_spot_key: Optional[tuple] = None
     idle_since: Optional[float] = None
-    # Last state reported by the client's status API (known clients only).
+    # Last state learned from the client's status API (known clients only):
+    # "busy" / "retry" from the status map, "idle" when a fresh poll lacks
+    # the session (opencode's idle report), "waiting" when it is blocked on
+    # a pending permission or question (detail carries which).
     client_status: Optional[str] = None
     client_status_detail: str = ""
     client_status_at: float = 0.0
@@ -306,17 +319,33 @@ class SessionQueue:
             return "busy", ""
         return "idle", ""
 
+    def _fresh_client_report(self, session: Session, now: float) -> bool:
+        """True while the session's last client report is still fresh."""
+        return (
+            session.client_status is not None
+            and session.client_status_at > 0
+            and now - session.client_status_at < STATUS_UNREACHABLE_GRACE
+        )
+
     def _release_deadline(self, session: Session, now: float) -> Optional[float]:
         """Monotonic deadline at which the session's spot is surrendered."""
         if session.inflight > 0:
             return None
         if session.client != "unknown":
-            if session.status != "idle" or session.idle_since is None:
+            if session.status not in ("idle", "waiting") or session.idle_since is None:
                 return None
+            if session.status == "waiting":
+                # Blocked on user input (permission/question): it will not
+                # make another model call until a human acts, so release
+                # immediately on a fresh report, regardless of the
+                # immediate_idle_release flag.
+                if self._fresh_client_report(session, now):
+                    return session.idle_since
+                return session.idle_since + self.session_expiry
             if (
                 self.immediate_idle_release
                 and session.client_status == "idle"
-                and now - session.client_status_at < STATUS_UNREACHABLE_GRACE
+                and self._fresh_client_report(session, now)
             ):
                 # The client truly told us it is idle (fresh report, not the
                 # unreachable-grace fallback): no cooldown, release now.
@@ -325,6 +354,14 @@ class SessionQueue:
         # Unknown clients: busy window and expiry are both measured from
         # the last request; whichever is longer wins.
         return session.last_request_at + max(self.busy_window, self.session_expiry)
+
+    def _release_reason(self, session: Session, now: float) -> str:
+        """Human-readable reason a spot release happened (for logs)."""
+        if session.status == "waiting" and self._fresh_client_report(session, now):
+            return f"waiting for input ({session.client_status_detail})"
+        if session.client_status == "idle" and self._fresh_client_report(session, now):
+            return "client reports idle (absent from status map)"
+        return f"idle for {self.session_expiry:.0f}s"
 
     def _release_spot(self, session: Session, key: tuple) -> None:
         self.spots.pop(key, None)
@@ -340,15 +377,16 @@ class SessionQueue:
     def tick(self, now: float) -> list:
         """
         Recomputes statuses, surrenders expired spots, and drops dead
-        session records. Returns the session keys released. Called ~1/s by
-        the queue manager after client-status polling.
+        session records. Returns (session key, reason) pairs for the spots
+        released. Called ~1/s by the queue manager after client-status
+        polling.
         """
         released = []
         for key, session in list(self.sessions.items()):
             status, detail = self._current_status(session, now)
             session.status = status
             session.status_detail = detail
-            if status == "idle":
+            if status in ("idle", "waiting"):
                 if session.idle_since is None:
                     session.idle_since = now
             else:
@@ -356,8 +394,9 @@ class SessionQueue:
             if session.spot_held:
                 deadline = self._release_deadline(session, now)
                 if deadline is not None and now >= deadline:
+                    reason = self._release_reason(session, now)
                     self._release_spot(session, key)
-                    released.append(key)
+                    released.append((key, reason))
             elif session.waiting == 0 and session.inflight == 0:
                 # No spot, nothing waiting: the session is gone (e.g. its
                 # only queued request was abandoned).
@@ -419,6 +458,13 @@ class SessionQueue:
                     "api": session.api,
                     "status": session.status,
                     "detail": session.status_detail,
+                    "client_status": session.client_status,
+                    "client_status_detail": session.client_status_detail,
+                    "client_status_age": (
+                        round(now - session.client_status_at, 1)
+                        if session.client_status_at
+                        else None
+                    ),
                     "spot": spot,
                     "spot_releases_in": releases_in,
                     "inflight": session.inflight,

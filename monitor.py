@@ -14,11 +14,14 @@ __all__ = ["build_data", "HTML_PAGE"]
 
 def build_data(queue, unknown_tracker, config: dict, state: dict) -> dict:
     now = time.monotonic()
+    manager_at = state.get("queue_manager_at")
     return {
         "config": {
             **config,
             "server_powered_on": state.get("is_powered_on"),
             "server_healthy": state.get("is_healthy"),
+            "power_managed": state.get("manage_power_with_proxy"),
+            "queue_manager_age": round(now - manager_at, 1) if manager_at else None,
             "active_sessions": len(queue.spots),
             "queued_requests": len(queue.queue),
         },
@@ -51,7 +54,7 @@ HTML_PAGE = """<!doctype html>
   .kv b { color: #999; font-weight: normal; }
   .status { font-weight: bold; }
   .busy { color: #6cf; } .queued { color: #fc6; } .idle { color: #9c9; }
-  .retry { color: #f77; }
+  .retry { color: #f77; } .waiting { color: #fa6; }
   .shared-spot { color: #c9f; font-weight: bold; }
   .muted { color: #666; font-weight: normal; }
   button.release { font-family: inherit; font-size: .72rem; background: #232323;
@@ -70,6 +73,7 @@ HTML_PAGE = """<!doctype html>
 <table id="sessions">
   <thead><tr>
     <th>#</th><th>session</th><th>client</th><th>api</th><th>status</th>
+    <th>client status</th>
     <th>spot</th><th>releases in</th><th>in-flight</th><th>waiting</th>
     <th>queue pos</th><th>last path</th><th>client ip</th>
   </tr></thead>
@@ -103,6 +107,12 @@ function render(d) {
     '<td class="nw">' + esc(s.api) + '</td>' +
     '<td class="status nw ' + s.status + '">' + esc(s.status) +
       (s.detail ? ' <span class="muted">' + esc(s.detail) + '</span>' : '') + '</td>' +
+    '<td class="nw ' + (s.client_status === 'waiting' ? 'waiting' : '') + '">'
+      + esc(s.client_status || '-') +
+      (s.client_status_detail
+      ? ' <span class="muted">' + esc(s.client_status_detail) + '</span>' : '') +
+      (s.client_status_age !== null && s.client_status_age !== undefined
+      ? ' <span class="muted">' + s.client_status_age + 's</span>' : '') + '</td>' +
     '<td class="nw">' + (s.spot === 'shared' ? '<span class="shared-spot">shared</span>' : s.spot)
       + (s.spot === 'held'
       ? ' <button class="release" data-client="' + esc(s.client) +
@@ -117,7 +127,7 @@ function render(d) {
     '<td class="nw">' + esc(s.client_ip) + '</td>' +
     '</tr>').join('');
   $('sessions').querySelector('tbody').innerHTML =
-    rows || '<tr><td colspan="12" class="muted">no sessions</td></tr>';
+    rows || '<tr><td colspan="13" class="muted">no sessions</td></tr>';
 
   const urows = d.unknown.map((u) => '<tr>' +
     '<td class="wrap">' + esc(u.id) + '</td>' +

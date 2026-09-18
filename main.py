@@ -448,87 +448,127 @@ async def queue_manager():
     last_health_check = 0.0
     while True:
         await asyncio.sleep(1.0)
-        now = time.monotonic()
+        try:
+            last_health_check = await _queue_manager_tick(last_health_check)
+            state["queue_manager_at"] = time.monotonic()
+        except Exception:
+            # A transient error must never kill the manager: without it,
+            # spots are never surrendered, statuses never recompute, and
+            # queued requests are never promoted or woken.
+            logger.exception("Queue manager tick failed; continuing.")
 
-        # 1) Client status polling.
-        bases: dict[str, list] = {}
-        for session in queue.sessions.values():
-            if session.client != "unknown":
-                base = status_poller.base_url(session.client_ip)
-                bases.setdefault(base, []).append(session)
-        for base, sessions in bases.items():
-            if not status_poller.due(base, now):
-                continue
-            # The status map is per-directory (one opencode "instance" per
-            # working directory), so first resolve each session's directory
-            # (GET /session/{id}, cached) and then poll one map per
-            # directory. Unreachable lookups are skipped; tick() keeps each
-            # session's last-known status for the grace period.
-            by_dir: dict[str, list] = {}
-            for session in sessions:
-                key = (base, session.session_id)
-                directory = status_poller.session_dir.get(key)
-                if directory is None:
-                    info = await status_poller.fetch_session_info(
-                        base, session.session_id
-                    )
-                    if info is None:
-                        continue
-                    directory, parent_id = info
-                    status_poller.session_dir[key] = directory
-                    status_poller.session_parent[key] = parent_id
-                by_dir.setdefault(directory, []).append(session)
-                # Sub-agent spot sharing: a session runs on the spot of its
-                # tracked ancestor (recomputed every poll - the ancestor's
-                # spot state changes over time).
-                session.shared_spot_key = resolve_shared_spot(base, session.session_id)
-            for directory, dir_sessions in by_dir.items():
-                data = await status_poller.fetch_statuses(base, directory)
-                if data is None:
+
+async def _queue_manager_tick(last_health_check: float) -> float:
+    now = time.monotonic()
+
+    # 1) Client status polling.
+    bases: dict[str, list] = {}
+    for session in queue.sessions.values():
+        if session.client != "unknown":
+            base = status_poller.base_url(session.client_ip)
+            bases.setdefault(base, []).append(session)
+    for base, sessions in bases.items():
+        if not status_poller.due(base, now):
+            continue
+        # The status map is per-directory (one opencode "instance" per
+        # working directory), so first resolve each session's directory
+        # (GET /session/{id}, cached) and then poll one map per
+        # directory. Unreachable lookups are skipped; tick() keeps each
+        # session's last-known status for the grace period.
+        by_dir: dict[str, list] = {}
+        for session in sessions:
+            key = (base, session.session_id)
+            directory = status_poller.session_dir.get(key)
+            if directory is None:
+                info = await status_poller.fetch_session_info(
+                    base, session.session_id
+                )
+                if info is None:
                     continue
+                directory, parent_id = info
+                status_poller.session_dir[key] = directory
+                status_poller.session_parent[key] = parent_id
+            by_dir.setdefault(directory, []).append(session)
+            # Sub-agent spot sharing: a session runs on the spot of its
+            # tracked ancestor (recomputed every poll - the ancestor's
+            # spot state changes over time).
+            session.shared_spot_key = resolve_shared_spot(base, session.session_id)
+        for directory, dir_sessions in by_dir.items():
+            data = await status_poller.fetch_statuses(base, directory)
+            # Sessions blocked on a pending permission or question stay
+            # "busy" in the status map, so the pending-request endpoints
+            # are the tie-breaker: a session with a confirmed pending
+            # request is "waiting" no matter what the map says. A failed
+            # poll (None) keeps the last-known state; once the pending
+            # request is gone, the status map applies again on the next
+            # poll (the map shows it as busy or absent).
+            pending = await status_poller.fetch_pending(base, directory)
+            if data is not None or pending is not None:
+                reported = time.monotonic()
                 for session in dir_sessions:
+                    reason = pending.get(session.session_id) if pending is not None else None
+                    if reason is not None:
+                        if session.client_status != "waiting":
+                            logger.info(
+                                f"Session {session.session_id} ({session.client}) "
+                                f"waiting for user input: {reason}."
+                            )
+                        session.client_status = "waiting"
+                        session.client_status_detail = reason
+                        session.client_status_at = reported
+                        continue
+                    if data is None:
+                        continue
                     st = data.get(session.session_id)
                     if not isinstance(st, dict):
+                        # A fresh map that lacks this session IS the
+                        # client's idle report: opencode removes idle
+                        # sessions from /session/status entirely.
+                        session.client_status = "idle"
+                        session.client_status_detail = "absent from status map (idle)"
+                        session.client_status_at = reported
                         continue
                     stype = st.get("type")
                     if stype not in ("busy", "idle", "retry"):
                         continue
                     session.client_status = stype
-                    session.client_status_at = time.monotonic()
+                    session.client_status_at = reported
                     session.client_status_detail = (
                         f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
                     )
-            status_poller.last_poll[base] = time.monotonic()
-            # Forget directory cache entries of sessions that are gone.
-            live = {s.session_id for s in sessions}
-            for key in [k for k in status_poller.session_dir if k[0] == base and k[1] not in live]:
-                status_poller.forget(key[0], key[1])
+        status_poller.last_poll[base] = time.monotonic()
+        # Forget directory cache entries of sessions that are gone.
+        live = {s.session_id for s in sessions}
+        for key in [k for k in status_poller.session_dir if k[0] == base and k[1] not in live]:
+            status_poller.forget(key[0], key[1])
 
-        # 2) Status recompute + spot surrender.
-        for key in queue.tick(now):
-            logger.info(
-                f"Session {key[1]} ({key[0]}) idle for {SESSION_EXPIRY}s: spot released, session removed."
-            )
+    # 2) Status recompute + spot surrender.
+    for key, reason in queue.tick(now):
+        logger.info(
+            f"Session {key[1]} ({key[0]}): spot released, session removed ({reason})."
+        )
 
-        # 3) Wake the machine / promote requests while the queue is not empty.
-        if queue.queue:
-            if now - last_health_check >= 2.0:
-                await check_health()
-                last_health_check = now
-            queue.healthy = state["is_healthy"]
-            if not queue.healthy:
-                # The first waiting request triggered the initial power-on
-                # in the request handler; this keeps the single boot cycle
-                # alive (re-issuing on cooldown) while later requests simply
-                # wait their turn.
-                if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
-                    await power_on()
-                    state["last_power_on_attempt"] = now
-            else:
-                queue._try_promote()
+    # 3) Wake the machine / promote requests while the queue is not empty.
+    if queue.queue:
+        if now - last_health_check >= 2.0:
+            await check_health()
+            last_health_check = now
+        queue.healthy = state["is_healthy"]
+        if not queue.healthy:
+            # The first waiting request triggered the initial power-on
+            # in the request handler; this keeps the single boot cycle
+            # alive (re-issuing on cooldown) while later requests simply
+            # wait their turn.
+            if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
+                await power_on()
+                state["last_power_on_attempt"] = now
+        else:
+            queue._try_promote()
 
-        # 4) Prune stale unknown-API entries.
-        unknown_tracker.prune(now, SESSION_EXPIRY)
+    # 4) Prune stale unknown-API entries.
+    unknown_tracker.prune(now, SESSION_EXPIRY)
+
+    return last_health_check
 
 
 @asynccontextmanager

@@ -29,7 +29,9 @@ PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PRO
 BASE_ENV = {
     # Fake BMC: power-on attempts fail fast with connection refused and can
     # never touch real hardware. Explicit vars also shield us from a local
-    # .env (load_dotenv does not override existing environment).
+    # .env (load_dotenv does not override existing environment) - every
+    # knob the tests depend on is set here, so a deployment .env in the
+    # repo (e.g. REQUEST_MODE=atomic) cannot leak in and change behavior.
     "IPMI_HOST": "127.0.0.1",
     "IPMI_USER": "test",
     "IPMI_PASS": "test",
@@ -38,6 +40,8 @@ BASE_ENV = {
     "OPENCODE_STATUS_PORT": str(STATUS_PORT),
     "CONCURRENT_SESSIONS": "1",
     "CONCURRENT_SESSION_REQUESTS": "-1",
+    "REQUEST_MODE": "parallel",
+    "IMMEDIATE_IDLE_RELEASE": "true",
     "UNKNOWN_API_POLICY": "allow",
     "SESSION_EXPIRY": "4",
     "CLIENT_BUSY_WINDOW": "2",
@@ -108,6 +112,16 @@ def mock_parent(sid, parent):
         params={"sid": sid, "parent": parent},
         timeout=3,
     )
+
+
+def mock_permission(sid, pending=True):
+    method = httpx.post if pending else httpx.delete
+    return method(f"http://127.0.0.1:{STATUS_PORT}/permission", params={"sid": sid}, timeout=3)
+
+
+def mock_question(sid, pending=True):
+    method = httpx.post if pending else httpx.delete
+    return method(f"http://127.0.0.1:{STATUS_PORT}/question", params={"sid": sid}, timeout=3)
 
 
 def check(name, cond, extra=""):
@@ -430,9 +444,16 @@ async def main():
     s1 = asyncio.create_task(client5.post(CHAT, json=BODY, headers={"x-session-id": "ses-S"}))
     await asyncio.sleep(1.0)
     s2 = asyncio.create_task(client5.post(CHAT, json=BODY, headers={"x-session-id": "ses-S"}))
-    await asyncio.sleep(0.3)
-    d = await monitor(PROXY5_PORT)
-    sr, ss = find_session(d, "ses-R"), find_session(d, "ses-S")
+    # S's two requests overlap only while the first is still running, so
+    # poll for the overlap instead of taking one snapshot.
+    sr = ss = None
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 4.0:
+        d = await monitor(PROXY5_PORT)
+        sr, ss = find_session(d, "ses-R"), find_session(d, "ses-S")
+        if ss is not None and ss["inflight"] == 2:
+            break
+        await asyncio.sleep(0.2)
     check("T15a S has 2 in-flight at once (parallel)", ss is not None and ss["inflight"] == 2 and ss["spot"] == "held", str(ss))
     check("T15b both sessions hold spots at the same time", sr is not None and sr["inflight"] == 1 and sr["spot"] == "held", f"{sr} / {ss}")
     await r1, await s1, await s2
@@ -479,14 +500,10 @@ async def main():
     check("T17b fresh idle report released the spot before the cooldown", find_session(d, "ses-IA") is None, str(d["sessions"]))
     rb = await client6.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-IB"})
     check("T17c second request ok (status never reported)", rb.status_code == 200, rb.text[:120])
-    await asyncio.sleep(2.5)
+    await asyncio.sleep(5)  # old behavior (stale-busy grace + cooldown) would still hold the spot
     d = await monitor(PROXY6_PORT)
-    sb = find_session(d, "ses-IB")
-    check("T17d inferred idle keeps the cooldown", sb is not None and sb["spot"] == "held", str(sb))
-    await asyncio.sleep(4)
-    d = await monitor(PROXY6_PORT)
-    check("T17e ...and is released after expiry", find_session(d, "ses-IB") is None, str(d["sessions"]))
-    check("T17f monitor config shows the flag", d["config"].get("immediate_idle_release") is True, str(d["config"].get("immediate_idle_release")))
+    check("T17d absent from the map is a confirmed idle: released before the cooldown", find_session(d, "ses-IB") is None, str(d["sessions"]))
+    check("T17e monitor config shows the flag", d["config"].get("immediate_idle_release") is True, str(d["config"].get("immediate_idle_release")))
 
     print("== T18: IMMEDIATE_IDLE_RELEASE=false restores the cooldown (proxy7) ==")
     client7 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY7_PORT}", timeout=30)
@@ -501,6 +518,112 @@ async def main():
     d = await monitor(PROXY7_PORT)
     check("T18c ...and is released after expiry", find_session(d, "ses-ID") is None, str(d["sessions"]))
     check("T18d monitor config shows the flag off", d["config"].get("immediate_idle_release") is False, str(d["config"].get("immediate_idle_release")))
+
+    print("== T19: absent from the status map is a confirmed idle report (proxy6) ==")
+    r19a = asyncio.create_task(client6.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-NA"}))
+    await asyncio.sleep(0.7)
+    r19b = asyncio.create_task(client6.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-NB"}))
+    await asyncio.sleep(0.7)
+    d = await monitor(PROXY6_PORT)
+    s19a, s19b = find_session(d, "ses-NA"), find_session(d, "ses-NB")
+    check("T19a A running (absent from map), B queued behind it", s19a is not None and s19a["spot"] == "held" and s19b is not None and s19b["waiting"] == 1 and s19b["queue_position"] == 1, f"{s19a} / {s19b}")
+    t0 = time.monotonic()
+    resp19a = await r19a
+    resp19b = await r19b
+    wait_b = time.monotonic() - t0
+    check("T19b A's absent-idle released the spot promptly and B ran", resp19a.status_code == 200 and resp19b.status_code == 200 and wait_b < 10, f"a={resp19a.status_code} b={resp19b.status_code} after {wait_b:.1f}s")
+    await asyncio.sleep(3)  # let both sessions' spots settle (B also absent -> released)
+
+    print("== T20: absent idle flips to idle immediately, cooldown still applies (proxy7) ==")
+    r20 = asyncio.create_task(client7.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-OC"}))
+    await asyncio.sleep(0.7)
+    d = await monitor(PROXY7_PORT)
+    s20 = find_session(d, "ses-OC")
+    check("T20a in-flight request shows busy", s20 is not None and s20["status"] == "busy" and s20["spot"] == "held", str(s20))
+    await r20
+    await asyncio.sleep(2)  # > poll interval, < SESSION_EXPIRY(4)
+    d = await monitor(PROXY7_PORT)
+    s20 = find_session(d, "ses-OC")
+    check("T20b absent session is idle right after the response (no stale-busy grace)", s20 is not None and s20["status"] == "idle" and s20["spot"] == "held", str(s20))
+    check("T20c spot counts down the cooldown", s20 is not None and s20["spot_releases_in"] is not None and 0 < s20["spot_releases_in"] <= 4, str(s20))
+    await asyncio.sleep(4)
+    d = await monitor(PROXY7_PORT)
+    check("T20d released after SESSION_EXPIRY (flag off)", find_session(d, "ses-OC") is None, str(d["sessions"]))
+
+    print("== T21: blocked on user input releases the spot, even with the flag off (proxy7) ==")
+    r21a = asyncio.create_task(client7.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-WP"}))
+    await asyncio.sleep(0.7)
+    mock_set("ses-WP", "busy")  # opencode stays "busy" in the map while blocked
+    mock_permission("ses-WP")
+    r21b = asyncio.create_task(client7.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-WQ"}))
+    # The poller records the pending permission as client_status "waiting"
+    # (opencode keeps the session "busy" in its status map while blocked).
+    # The spot itself is released on the next tick once the in-flight
+    # request ends, so the observable proof is the client_status, which is
+    # visible for the whole window.
+    saw_waiting = None
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 4.0:
+        d = await monitor(PROXY7_PORT)
+        sw = find_session(d, "ses-WP")
+        if sw is not None and sw["client_status"] == "waiting" and sw["spot"] == "held":
+            saw_waiting = sw
+            break
+        await asyncio.sleep(0.2)
+    check("T21a session listed as waiting (permission) with its spot held", saw_waiting is not None and saw_waiting["client_status_detail"] == "permission", str(saw_waiting))
+    t0 = time.monotonic()
+    resp21a = await r21a
+    resp21b = await r21b
+    wait_b = time.monotonic() - t0
+    # With the flag off the cooldown alone would hold the spot until
+    # idle+4s, so B finishing within ~6s proves the waiting-for-input
+    # release fired, not the cooldown.
+    check("T21b waiting-for-input released the spot before the cooldown and B ran", resp21a.status_code == 200 and resp21b.status_code == 200 and wait_b < 6, f"a={resp21a.status_code} b={resp21b.status_code} after {wait_b:.1f}s")
+    mock_permission("ses-WP", pending=False)  # the user answers the prompt
+    r21c = await client7.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-WP"})
+    check("T21c answered session re-enters the queue and runs", r21c.status_code == 200, r21c.text[:120])
+    mock_set("ses-WP", "idle")
+    mock_set("ses-WQ", "idle")
+    await asyncio.sleep(7)
+    d = await monitor(PROXY7_PORT)
+    check("T21d all spots released afterwards", find_session(d, "ses-WP") is None and find_session(d, "ses-WQ") is None, str(d["sessions"]))
+
+    print("== T22: spot/record invariants (unit) ==")
+    sys.path.insert(0, REPO)
+    from session_queue import SessionQueue as UnitQueue, QueueEntry as UnitEntry
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+    q = UnitQueue(max_spots=1, max_inflight_per_session=-1, busy_window=2, session_expiry=4, immediate_idle_release=True)
+    q.healthy = True
+    ses = q.get_or_create_session("opencode", "unit-A", "openai", "1.2.3.4", "opencode/1.0")
+    e = UnitEntry(session=ses, path="/v1/chat/completions", body=b"{}", request=_FakeRequest(), enqueued_at=time.monotonic())
+    q.enqueue(e)
+    check("T22a promoted and spot acquired", e.done and ses.spot_held and len(q.spots) == 1, f"done={e.done} spot_held={ses.spot_held}")
+    check("T22b every spot owner is a tracked session", set(q.spots) <= set(q.sessions), f"{set(q.spots)} vs {set(q.sessions)}")
+    q.release(e, 200)
+    t_now = time.monotonic()
+    ses.client_status = "idle"
+    ses.client_status_detail = "absent from status map (idle)"
+    ses.client_status_at = t_now
+    released = q.tick(t_now + 0.1)
+    check("T22c absent-idle releases the spot on the next tick", len(released) == 1 and len(q.spots) == 0, str(released))
+    check("T22d release carries the idle reason", released and "idle" in released[0][1], str(released))
+    check("T22e session forgotten after release", all(k[1] != "unit-A" for k in q.sessions), str(list(q.sessions)))
+    ses2 = q.get_or_create_session("opencode", "unit-B", "openai", "1.2.3.4", "opencode/1.0")
+    e2 = UnitEntry(session=ses2, path="/v1/chat/completions", body=b"{}", request=_FakeRequest(), enqueued_at=time.monotonic())
+    q.enqueue(e2)
+    q.release(e2, 200)
+    t_now2 = time.monotonic()
+    ses2.client_status = "waiting"
+    ses2.client_status_detail = "permission"
+    ses2.client_status_at = t_now2
+    released2 = q.tick(t_now2 + 0.1)
+    check("T22f waiting-for-input releases the spot on the next tick", len(released2) == 1 and len(q.spots) == 0, str(released2))
+    check("T22g release carries the waiting reason", released2 and "waiting" in released2[0][1], str(released2))
+    check("T22h invariants hold at the end", set(q.spots) <= set(q.sessions) and not q.queue, f"{set(q.spots)} {list(q.sessions)}")
 
     await client.aclose()
     await client2.aclose()
