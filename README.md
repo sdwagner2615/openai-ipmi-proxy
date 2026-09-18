@@ -51,7 +51,8 @@ This proxy allows high-power AI workstations to remain powered off when not in u
      - `CONCURRENT_SESSION_REQUESTS`: Max in-flight requests per session — `-1` unlimited (default), `N` a cap, `0` serialized.
      - `REQUEST_MODE`: How spot-holding sessions share the model — `parallel` (default) lets each run its requests at the same time; `atomic` admits at most one in-flight request globally at a time (sessions and their spots still overlap, but the requests alternate FIFO).
     - `UNKNOWN_API_POLICY`: `allow` (default) passes non-OpenAI/Anthropic traffic through unqueued; `block` rejects it with 403.
-    - `SESSION_EXPIRY`: Seconds a session may stay idle before its spot is released and the session is forgotten (default: `300`).
+     - `SESSION_EXPIRY`: Seconds a session may stay idle before its spot is released and the session is forgotten (default: `300`).
+     - `IMMEDIATE_IDLE_RELEASE`: When `true` (default), known clients (e.g. opencode) that truly report `idle` over their status API surrender their spot immediately instead of waiting out `SESSION_EXPIRY`. Set to `false` to restore the cooldown. Inferred idle — the status API is unreachable or never reported the session — keeps the cooldown either way, as do unknown clients.
     - `CLIENT_BUSY_WINDOW`: Seconds after their last request that unknown clients count as busy (default: `120`).
     - `CLIENT_STATUS_POLL`: Seconds between polls of known clients' status APIs (default: `5`).
     - `QUEUE_TIMEOUT`: Max seconds a request may wait in the queue before a 504; `0` = no timeout (default).

@@ -82,6 +82,16 @@ SESSION_ID_HEADERS = tuple(
 REQUEST_MODE = os.getenv("REQUEST_MODE", "parallel").strip().lower()
 if REQUEST_MODE not in ("parallel", "atomic"):
     REQUEST_MODE = "parallel"
+# Known clients (e.g. opencode) that truly report "idle" over their status
+# API surrender their spot immediately instead of waiting SESSION_EXPIRY
+# (on by default). Inferred idle (status API unreachable / never reported)
+# and unknown clients keep the normal cooldown.
+IMMEDIATE_IDLE_RELEASE = os.getenv("IMMEDIATE_IDLE_RELEASE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
@@ -116,6 +126,7 @@ queue = SessionQueue(
     busy_window=CLIENT_BUSY_WINDOW,
     session_expiry=SESSION_EXPIRY,
     atomic_requests=(REQUEST_MODE == "atomic"),
+    immediate_idle_release=IMMEDIATE_IDLE_RELEASE,
 )
 unknown_tracker = UnknownTracker()
 status_poller: StatusPoller = None
@@ -124,6 +135,7 @@ PROXY_CONFIG = {
     "concurrent_sessions": CONCURRENT_SESSIONS,
     "concurrent_session_requests": CONCURRENT_SESSION_REQUESTS,
     "request_mode": REQUEST_MODE,
+    "immediate_idle_release": IMMEDIATE_IDLE_RELEASE,
     "unknown_api_policy": UNKNOWN_API_POLICY,
     "session_expiry": SESSION_EXPIRY,
     "client_busy_window": CLIENT_BUSY_WINDOW,

@@ -4,7 +4,7 @@ Local integration test for the session queue.
 Spawns (all on 127.0.0.1, non-default ports, no docker, no real hardware):
   - a mock LLM target            (port 8100)
   - a mock opencode status server (port 8101)
-  - the proxy under test         (port 8123, + 8124-8127 for alternate config)
+  - the proxy under test         (port 8123, + 8124-8129 for alternate config)
 
 Run:  venv/bin/python scripts/test_queue.py
 """
@@ -24,7 +24,7 @@ LOGDIR = "/tmp/opencode/proxy-test"
 os.makedirs(LOGDIR, exist_ok=True)
 
 TARGET_PORT, STATUS_PORT = 8100, 8101
-PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT = 8123, 8124, 8125, 8126, 8127
+PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT = 8123, 8124, 8125, 8126, 8127, 8128, 8129
 
 BASE_ENV = {
     # Fake BMC: power-on attempts fail fast with connection refused and can
@@ -137,7 +137,7 @@ async def main():
     # the mock ports need to be free.
     ports = [TARGET_PORT, STATUS_PORT] if skip_proxy else [
         TARGET_PORT, STATUS_PORT, PROXY_PORT, PROXY2_PORT, PROXY3_PORT,
-        PROXY4_PORT, PROXY5_PORT,
+        PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT,
     ]
     check_ports_free(ports)
     print("== spawning mocks ==")
@@ -171,11 +171,23 @@ async def main():
             [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY5_PORT)],
             {**BASE_ENV, "CONCURRENT_SESSIONS": "2"},
         )
+        spawn(
+            "proxy6",
+            [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY6_PORT)],
+            {**BASE_ENV, "IMMEDIATE_IDLE_RELEASE": "true"},
+        )
+        spawn(
+            "proxy7",
+            [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY7_PORT)],
+            {**BASE_ENV, "IMMEDIATE_IDLE_RELEASE": "false"},
+        )
     await wait_http(f"http://127.0.0.1:{PROXY_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY2_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY3_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY4_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY5_PORT}/monitor/data")
+    await wait_http(f"http://127.0.0.1:{PROXY6_PORT}/monitor/data")
+    await wait_http(f"http://127.0.0.1:{PROXY7_PORT}/monitor/data")
 
     client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY_PORT}", timeout=30)
 
@@ -457,11 +469,46 @@ async def main():
     mock_set("ses-PC", "idle")
     await asyncio.sleep(7)
 
+    print("== T17: IMMEDIATE_IDLE_RELEASE (proxy6) ==")
+    client6 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY6_PORT}", timeout=30)
+    ra = await client6.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-IA"})
+    mock_set("ses-IA", "idle")
+    check("T17a request ok", ra.status_code == 200, ra.text[:120])
+    await asyncio.sleep(3.5)  # < SESSION_EXPIRY(4): the cooldown would still hold it
+    d = await monitor(PROXY6_PORT)
+    check("T17b fresh idle report released the spot before the cooldown", find_session(d, "ses-IA") is None, str(d["sessions"]))
+    rb = await client6.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-IB"})
+    check("T17c second request ok (status never reported)", rb.status_code == 200, rb.text[:120])
+    await asyncio.sleep(2.5)
+    d = await monitor(PROXY6_PORT)
+    sb = find_session(d, "ses-IB")
+    check("T17d inferred idle keeps the cooldown", sb is not None and sb["spot"] == "held", str(sb))
+    await asyncio.sleep(4)
+    d = await monitor(PROXY6_PORT)
+    check("T17e ...and is released after expiry", find_session(d, "ses-IB") is None, str(d["sessions"]))
+    check("T17f monitor config shows the flag", d["config"].get("immediate_idle_release") is True, str(d["config"].get("immediate_idle_release")))
+
+    print("== T18: IMMEDIATE_IDLE_RELEASE=false restores the cooldown (proxy7) ==")
+    client7 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY7_PORT}", timeout=30)
+    rc = await client7.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-ID"})
+    mock_set("ses-ID", "idle")
+    check("T18a request ok", rc.status_code == 200, rc.text[:120])
+    await asyncio.sleep(3.5)  # < SESSION_EXPIRY(4): with the flag on it would be gone by now
+    d = await monitor(PROXY7_PORT)
+    sd = find_session(d, "ses-ID")
+    check("T18b fresh idle still waits out the cooldown (flag off)", sd is not None and sd["spot"] == "held", str(sd))
+    await asyncio.sleep(4)
+    d = await monitor(PROXY7_PORT)
+    check("T18c ...and is released after expiry", find_session(d, "ses-ID") is None, str(d["sessions"]))
+    check("T18d monitor config shows the flag off", d["config"].get("immediate_idle_release") is False, str(d["config"].get("immediate_idle_release")))
+
     await client.aclose()
     await client2.aclose()
     await client3.aclose()
     await client4.aclose()
     await client5.aclose()
+    await client6.aclose()
+    await client7.aclose()
 
     print()
     failed = [n for n, ok in results if not ok]

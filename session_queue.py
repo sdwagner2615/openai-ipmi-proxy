@@ -37,6 +37,13 @@ of holding one of its own - a sub-agent is part of its parent's turn, so it
 needs no separate slot. Sharing is checked dynamically: if the ancestor's
 spot is released, the child simply stops sharing and queues like any other
 session. Sharing never takes a spot from another session.
+
+Immediate idle release (immediate_idle_release): by default a known client
+keeps its spot for SESSION_EXPIRY after it goes idle, so a short gap does
+not evict its K/V cache. When enabled, a known client that truly reports
+"idle" over its status API (fresh report, not the unreachable-grace
+fallback) surrenders its spot immediately; unknown clients and inferred
+idle are unaffected.
 """
 
 import asyncio
@@ -99,6 +106,7 @@ class SessionQueue:
         busy_window: float,
         session_expiry: float,
         atomic_requests: bool = False,
+        immediate_idle_release: bool = False,
     ):
         self.max_spots = max(1, max_spots)
         # -1 = unlimited per-session concurrency, 0 = serialized.
@@ -108,6 +116,9 @@ class SessionQueue:
         # atomic: admit at most one in-flight request globally at a time.
         self.atomic_requests = atomic_requests
         self.inflight_total = 0
+        # Known clients that truly report "idle" surrender their spot
+        # immediately instead of waiting SESSION_EXPIRY.
+        self.immediate_idle_release = immediate_idle_release
         self.sessions: dict[tuple, Session] = {}
         # spot-holding sessions, keyed by session key; dict order is the
         # order in which spots were acquired (used for monitor ordering).
@@ -295,13 +306,21 @@ class SessionQueue:
             return "busy", ""
         return "idle", ""
 
-    def _release_deadline(self, session: Session) -> Optional[float]:
+    def _release_deadline(self, session: Session, now: float) -> Optional[float]:
         """Monotonic deadline at which the session's spot is surrendered."""
         if session.inflight > 0:
             return None
         if session.client != "unknown":
             if session.status != "idle" or session.idle_since is None:
                 return None
+            if (
+                self.immediate_idle_release
+                and session.client_status == "idle"
+                and now - session.client_status_at < STATUS_UNREACHABLE_GRACE
+            ):
+                # The client truly told us it is idle (fresh report, not the
+                # unreachable-grace fallback): no cooldown, release now.
+                return session.idle_since
             return session.idle_since + self.session_expiry
         # Unknown clients: busy window and expiry are both measured from
         # the last request; whichever is longer wins.
@@ -335,7 +354,7 @@ class SessionQueue:
             else:
                 session.idle_since = None
             if session.spot_held:
-                deadline = self._release_deadline(session)
+                deadline = self._release_deadline(session, now)
                 if deadline is not None and now >= deadline:
                     self._release_spot(session, key)
                     released.append(key)
@@ -389,7 +408,7 @@ class SessionQueue:
             elif session.shared_spot_key is not None and session.shared_spot_key in self.spots:
                 spot = "shared"
             if session.spot_held:
-                deadline = self._release_deadline(session)
+                deadline = self._release_deadline(session, now)
                 if deadline is not None:
                     releases_in = round(max(0.0, deadline - now), 1)
             rows.append(
