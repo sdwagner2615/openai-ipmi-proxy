@@ -38,8 +38,7 @@ HTML_PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-         background: #111; color: #ddd; margin: 2rem auto; max-width: 1100px;
-         padding: 0 1rem; }
+         background: #111; color: #ddd; margin: 2rem auto; padding: 0 1rem; }
   h1 { font-size: 1.2rem; margin-bottom: 1rem; }
   h2 { font-size: 1rem; margin-top: 1.6rem; }
   .tablewrap { overflow-x: auto; }
