@@ -1,10 +1,12 @@
 """
 Monitoring page for the queue.
 
-GET /monitor       -> single self-contained HTML page (no external assets),
-                      polls the JSON endpoint every 2 seconds.
-GET /monitor/data  -> JSON snapshot of configuration, known sessions (in
-                      queue order) and unknown-API sessions.
+GET  /monitor          -> single self-contained HTML page (no external
+                          assets), polls the JSON endpoint every 2 seconds.
+GET  /monitor/data     -> JSON snapshot of configuration, known sessions
+                          (in queue order) and unknown-API sessions.
+POST /monitor/shutdown -> toggle the per-power-cycle auto power-off switch.
+POST /monitor/timeout  -> set the proxy-to-target read timeout (0 = none).
 """
 
 import time
@@ -61,6 +63,15 @@ HTML_PAGE = """<!doctype html>
                    padding: .05rem .4rem; cursor: pointer; vertical-align: middle; }
   button.release:hover { background: #fc6; color: #111; }
   button.release:disabled { opacity: .5; cursor: default; }
+  button.toggle, button.apply { font-family: inherit; font-size: .72rem;
+                   background: #232323; color: #9c9; border: 1px solid #335c33;
+                   border-radius: 3px; padding: .05rem .4rem; cursor: pointer;
+                   vertical-align: middle; }
+  button.toggle:hover, button.apply:hover { background: #9c9; color: #111; }
+  button.toggle:disabled, button.apply:disabled { opacity: .5; cursor: default; }
+  input.timeout-input { font-family: inherit; font-size: .72rem; background: #232323;
+                        color: #ddd; border: 1px solid #444; border-radius: 3px;
+                        padding: .05rem .3rem; width: 5.5rem; vertical-align: middle; }
   #updated { color: #666; font-size: .8rem; font-weight: normal; }
 </style>
 </head>
@@ -96,8 +107,29 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
 
 function render(d) {
   $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
-  $('config').innerHTML = Object.entries(d.config).map(([k, v]) =>
-    '<div><b>' + esc(k) + ':</b> ' + esc(v) + '</div>').join('');
+  $('config').innerHTML = Object.entries(d.config).map(([k, v]) => {
+    if (k === 'shutdown_enabled') {
+      const on = v === true || v === 'true';
+      return '<div><b>auto power-off this cycle:</b> <span class="status '
+        + (on ? 'idle' : 'retry') + '">' + (on ? 'on' : 'off') + '</span>'
+        + ' <span class="muted">after ' + esc(d.config.idle_timeout ?? 'unknown')
+        + 's idle; resets to SHUTDOWN_ENABLED on the next power-on</span> '
+        + '<button class="toggle" id="shutdown-toggle" data-on="' + (on ? 'on' : 'off') + '" '
+        + 'title="Toggle automatic shutdown for the current power cycle">'
+        + (on ? 'off' : 'on') + '</button></div>';
+    }
+    if (k === 'target_read_timeout') {
+      const num = Number(v);
+      const none = Number.isFinite(num) && num === 0;
+      return '<div><b>target read timeout:</b> ' + esc(none ? 'none' : v + 's')
+        + ' <span class="muted">max silence from the target; 0 = no timeout</span> '
+        + '<input class="timeout-input" id="read-timeout" type="number" min="0" step="1" '
+        + 'value="' + (none ? 0 : num) + '"> '
+        + '<button class="apply" id="timeout-apply" '
+        + 'title="Apply the target read timeout in seconds (0 = no timeout)">apply</button></div>';
+    }
+    return '<div><b>' + esc(k) + ':</b> ' + esc(v) + '</div>';
+  }).join('');
 
   const rows = d.sessions.map((s) => '<tr>' +
     '<td class="nw">' + s.position + '</td>' +
@@ -152,6 +184,40 @@ function render(d) {
       }
     };
   });
+
+  const st = $('shutdown-toggle');
+  if (st) {
+    st.onclick = async () => {
+      st.disabled = true;
+      try {
+        await fetch('/monitor/shutdown', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: st.dataset.on === 'off' }),
+        });
+      } finally {
+        refresh();
+      }
+    };
+  }
+
+  const ta = $('timeout-apply');
+  if (ta) {
+    ta.onclick = async () => {
+      const val = parseInt($('read-timeout').value, 10);
+      if (!Number.isInteger(val) || val < 0) return;
+      ta.disabled = true;
+      try {
+        await fetch('/monitor/timeout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ read_timeout: val }),
+        });
+      } finally {
+        refresh();
+      }
+    };
+  }
 }
 
 async function refresh() {

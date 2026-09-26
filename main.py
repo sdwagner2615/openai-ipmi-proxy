@@ -35,9 +35,19 @@ TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
 # /health/liveliness).
 HEALTH_PATH = "/" + os.getenv("HEALTH_PATH", "/health").lstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
-# Kill switch for the idle auto-shutdown. Power-on still works when disabled;
-# it only stops the proxy from ever shutting the workstation down.
+# Default (per power cycle) for the idle auto-shutdown switch. Power-on
+# still works when disabled; it only stops the proxy from shutting the
+# workstation down. The live per-cycle value lives in state
+# (state["shutdown_enabled"]): the monitor page can toggle it, and every
+# proxy-initiated power-on resets it to this default.
 SHUTDOWN_ENABLED = os.getenv("SHUTDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Max seconds to wait for the next chunk from the target: per-chunk
+# silence for SSE streams, the whole body for non-streaming responses.
+# 0 = no timeout (default) - clients run with no timeout, so a slow model
+# must not become a proxy error. N = cap, to drop a truly hung target.
+# The live value (editable from the monitor page) is in
+# state["target_read_timeout"].
+TARGET_READ_TIMEOUT = max(0, int(os.getenv("TARGET_READ_TIMEOUT", "0")))
 
 # --- Queuing configuration -------------------------------------------------
 # How many distinct sessions may hold a spot (run against the target) at once.
@@ -114,6 +124,13 @@ state = {
     "is_powered_on": None,
     "is_healthy": None,
     "manage_power_with_proxy": False,
+    # Live per-power-cycle copy of SHUTDOWN_ENABLED: the monitor page
+    # toggles it for the current cycle, and every proxy-initiated
+    # power-on resets it to the env default (a new cycle starts).
+    "shutdown_enabled": SHUTDOWN_ENABLED,
+    # Live copy of TARGET_READ_TIMEOUT, adjustable at runtime from the
+    # monitor page (applies to new requests only).
+    "target_read_timeout": TARGET_READ_TIMEOUT,
     "last_power_on_attempt": 0,
     "power_on_cooldown": 30,
     "discovered_system_path": "/redfish/v1/Systems/Self" # Hardcoded after discovery of BMC firmware behavior
@@ -195,6 +212,11 @@ async def power_on():
     """
     Issues a Redfish command to power on the server.
 
+    A successful power-on starts a new power cycle, so the per-cycle
+    auto power-off switch is reset to its SHUTDOWN_ENABLED default - an
+    override made from the monitor page in the previous cycle no longer
+    applies.
+
     Returns:
         httpx.Response: The result of the IPMI API call.
     """
@@ -206,6 +228,8 @@ async def power_on():
         # The proxy initiated this power-on, so it now owns the power lifecycle
         # and is allowed to shut the server down again after idle timeout.
         state["manage_power_with_proxy"] = True
+        # New cycle: the auto power-off switch starts from the env default.
+        state["shutdown_enabled"] = SHUTDOWN_ENABLED
     return res
 
 
@@ -351,13 +375,17 @@ async def forward_request(
 
     try:
         # We define the timeout on the Request object.
-        # a read timeout of 300s is used to accommodate long LLM generation times.
+        # connect/write/pool are unlimited; the read timeout (TARGET_READ_TIMEOUT,
+        # live in state) bounds the silence from the target - per chunk for SSE
+        # streams, the whole body for non-streaming responses. 0 = no timeout,
+        # so long LLM generations never die at a proxy timeout.
+        read_timeout = state["target_read_timeout"] or None
         req = http_client.build_request(
             method=request.method,
             url=url,
             headers=headers,
             content=body,
-            timeout=httpx.Timeout(None, read=300.0)
+            timeout=httpx.Timeout(None, read=read_timeout)
         )
 
         response = await http_client.send(req, stream=True)
@@ -405,12 +433,17 @@ async def idle_monitor():
     and never used through the proxy is never powered off by this monitor.
     While the queue has work (queued requests or held spots) the machine is
     never taken down and the idle timer is restarted.
+
+    The auto power-off switch is per power cycle (state["shutdown_enabled"]):
+    seeded from SHUTDOWN_ENABLED, toggleable from the monitor page, and
+    reset to the env default on every proxy-initiated power-on.
     """
     while True:
         await asyncio.sleep(60)
-        # Auto-shutdown disabled via SHUTDOWN_ENABLED: power-on still works,
-        # we just never take the server down.
-        if not SHUTDOWN_ENABLED:
+        # Auto power-off disabled for this cycle (env default or the
+        # monitor toggle): power-on still works, we just never take the
+        # server down.
+        if not state["shutdown_enabled"]:
             continue
         if queue.has_activity():
             state["last_request_time"] = time.monotonic()
@@ -615,7 +648,15 @@ async def monitor_page():
 @app.get("/monitor/data")
 async def monitor_data():
     """JSON snapshot of configuration, sessions and unknown-API activity."""
-    config = {**PROXY_CONFIG, "target_server_url": TARGET_SERVER_URL}
+    config = {
+        **PROXY_CONFIG,
+        "target_server_url": TARGET_SERVER_URL,
+        # Live values (editable from the monitor page) plus the static
+        # idle timeout, for context next to the auto power-off switch.
+        "idle_timeout": IDLE_TIMEOUT,
+        "shutdown_enabled": state["shutdown_enabled"],
+        "target_read_timeout": state["target_read_timeout"],
+    }
     return JSONResponse(build_data(queue, unknown_tracker, config, state))
 
 
@@ -642,6 +683,52 @@ async def monitor_release(request: Request):
         )
     logger.info(f"Spot manually released for session {session_id} ({client}).")
     return JSONResponse({"released": True})
+
+
+@app.post("/monitor/shutdown")
+async def monitor_shutdown(request: Request):
+    """
+    Toggles the per-power-cycle auto power-off switch (backed by the
+    toggle on the monitor page). It lasts only for the current cycle:
+    the next proxy-initiated power-on resets it to SHUTDOWN_ENABLED.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {enabled}."})
+    if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Expected a JSON body {enabled: true|false}."},
+        )
+    state["shutdown_enabled"] = data["enabled"]
+    logger.info(
+        f"Auto power-off this cycle {'enabled' if data['enabled'] else 'disabled'} from monitor "
+        f"(resets to SHUTDOWN_ENABLED={SHUTDOWN_ENABLED} on the next proxy-initiated power-on)."
+    )
+    return JSONResponse({"shutdown_enabled": data["enabled"]})
+
+
+@app.post("/monitor/timeout")
+async def monitor_timeout(request: Request):
+    """
+    Sets the proxy-to-target read timeout in seconds at runtime (backed
+    by the input + apply button on the monitor page). 0 = no timeout.
+    Applies to new requests only.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {read_timeout}."})
+    value = data.get("read_timeout") if isinstance(data, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Expected a JSON body {read_timeout: N} with N a non-negative integer (0 = no timeout)."},
+        )
+    state["target_read_timeout"] = value
+    logger.info(f"Target read timeout set to {value or 'none'} from monitor.")
+    return JSONResponse({"target_read_timeout": value})
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

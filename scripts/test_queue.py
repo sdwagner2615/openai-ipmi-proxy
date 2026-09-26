@@ -4,7 +4,7 @@ Local integration test for the session queue.
 Spawns (all on 127.0.0.1, non-default ports, no docker, no real hardware):
   - a mock LLM target            (port 8100)
   - a mock opencode status server (port 8101)
-  - the proxy under test         (port 8123, + 8124-8129 for alternate config)
+  - the proxy under test         (port 8123, + 8124-8130 for alternate config)
 
 Run:  venv/bin/python scripts/test_queue.py
 """
@@ -24,7 +24,7 @@ LOGDIR = "/tmp/opencode/proxy-test"
 os.makedirs(LOGDIR, exist_ok=True)
 
 TARGET_PORT, STATUS_PORT = 8100, 8101
-PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT = 8123, 8124, 8125, 8126, 8127, 8128, 8129
+PROXY_PORT, PROXY2_PORT, PROXY3_PORT, PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT, PROXY8_PORT = 8123, 8124, 8125, 8126, 8127, 8128, 8129, 8130
 
 BASE_ENV = {
     # Fake BMC: power-on attempts fail fast with connection refused and can
@@ -151,7 +151,7 @@ async def main():
     # the mock ports need to be free.
     ports = [TARGET_PORT, STATUS_PORT] if skip_proxy else [
         TARGET_PORT, STATUS_PORT, PROXY_PORT, PROXY2_PORT, PROXY3_PORT,
-        PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT,
+        PROXY4_PORT, PROXY5_PORT, PROXY6_PORT, PROXY7_PORT, PROXY8_PORT,
     ]
     check_ports_free(ports)
     print("== spawning mocks ==")
@@ -195,6 +195,11 @@ async def main():
             [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY7_PORT)],
             {**BASE_ENV, "IMMEDIATE_IDLE_RELEASE": "false"},
         )
+        spawn(
+            "proxy8",
+            [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(PROXY8_PORT)],
+            {**BASE_ENV, "TARGET_READ_TIMEOUT": "1"},
+        )
     await wait_http(f"http://127.0.0.1:{PROXY_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY2_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY3_PORT}/monitor/data")
@@ -202,6 +207,8 @@ async def main():
     await wait_http(f"http://127.0.0.1:{PROXY5_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY6_PORT}/monitor/data")
     await wait_http(f"http://127.0.0.1:{PROXY7_PORT}/monitor/data")
+    if not skip_proxy:
+        await wait_http(f"http://127.0.0.1:{PROXY8_PORT}/monitor/data")
 
     client = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY_PORT}", timeout=30)
 
@@ -624,6 +631,55 @@ async def main():
     check("T22f waiting-for-input releases the spot on the next tick", len(released2) == 1 and len(q.spots) == 0, str(released2))
     check("T22g release carries the waiting reason", released2 and "waiting" in released2[0][1], str(released2))
     check("T22h invariants hold at the end", set(q.spots) <= set(q.sessions) and not q.queue, f"{set(q.spots)} {list(q.sessions)}")
+
+    print("== T23: monitor controls: auto power-off toggle + target read timeout ==")
+    d = await monitor()
+    check(
+        "T23a defaults: shutdown on, read timeout none (0), idle timeout shown",
+        d["config"].get("shutdown_enabled") is True and d["config"].get("target_read_timeout") == 0 and d["config"].get("idle_timeout") == 3600,
+        str(d["config"]),
+    )
+    page = (await client.get("/monitor")).text
+    check(
+        "T23b monitor page wires the toggle + timeout input",
+        'id="shutdown-toggle"' in page and 'id="read-timeout"' in page and 'id="timeout-apply"' in page,
+    )
+    r = await client.post("/monitor/shutdown", json={"enabled": False})
+    d = await monitor()
+    check("T23c toggle off is applied", r.status_code == 200 and r.json().get("shutdown_enabled") is False and d["config"].get("shutdown_enabled") is False, f"{r.status_code} {d['config'].get('shutdown_enabled')}")
+    bad = await client.post("/monitor/shutdown", json={"enabled": "yes"})
+    check("T23d non-bool toggle body -> 400", bad.status_code == 400, f"{bad.status_code} {bad.text[:120]}")
+    r = await client.post("/monitor/shutdown", json={"enabled": True})
+    d = await monitor()
+    check("T23e toggle back on", r.status_code == 200 and d["config"].get("shutdown_enabled") is True, f"{r.status_code} {d['config'].get('shutdown_enabled')}")
+    r = await client.post("/monitor/timeout", json={"read_timeout": 5})
+    d = await monitor()
+    check("T23f read timeout set to 5", r.status_code == 200 and d["config"].get("target_read_timeout") == 5, f"{r.status_code} {d['config'].get('target_read_timeout')}")
+    bad = None
+    for bad_body in ({"read_timeout": -1}, {"read_timeout": "abc"}, {"read_timeout": True}):
+        bad = await client.post("/monitor/timeout", json=bad_body)
+        if bad.status_code != 400:
+            break
+    check("T23g invalid read-timeout bodies -> 400", bad.status_code == 400, f"{bad.status_code} {bad.text[:120]}")
+    r = await client.post("/monitor/timeout", json={"read_timeout": 0})
+    d = await monitor()
+    check("T23h read timeout back to none (0)", r.status_code == 200 and d["config"].get("target_read_timeout") == 0, f"{r.status_code} {d['config'].get('target_read_timeout')}")
+
+    if not skip_proxy:
+        print("== T24: target read timeout (proxy8: TARGET_READ_TIMEOUT=1, mock delay 2s) ==")
+        client8 = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PROXY8_PORT}", timeout=30)
+        t0 = time.monotonic()
+        r = await client8.post(CHAT, json=BODY, headers={"x-session-id": "ses-TD"})
+        wait_s = time.monotonic() - t0
+        check("T24a slow target dropped with 502 at the read timeout", r.status_code == 502 and 0.8 < wait_s < 6, f"{r.status_code} after {wait_s:.1f}s: {r.text[:120]}")
+        r = await client8.post("/monitor/timeout", json={"read_timeout": 0})
+        d = await monitor(PROXY8_PORT)
+        check("T24b runtime 0 = no timeout", r.status_code == 200 and d["config"].get("target_read_timeout") == 0, f"{r.status_code} {d['config'].get('target_read_timeout')}")
+        t0 = time.monotonic()
+        r = await client8.post(CHAT, json=BODY, headers={"x-session-id": "ses-TD"})
+        wait_s = time.monotonic() - t0
+        check("T24c 2s generation succeeds once the timeout is lifted", r.status_code == 200 and 1.8 < wait_s < 10, f"{r.status_code} after {wait_s:.1f}s: {r.text[:120]}")
+        await client8.aclose()
 
     await client.aclose()
     await client2.aclose()
