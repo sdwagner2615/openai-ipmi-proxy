@@ -3,10 +3,16 @@ import asyncio
 import time
 import httpx
 import logging
-from fastapi import FastAPI, Request, Response, BackgroundTasks
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+from typing import Optional
+
+from apis import detect_api, session_id_from_body
+from clients import detect_client, session_header_value, StatusPoller
+from session_queue import SessionQueue, QueueEntry, UnknownTracker
+from monitor import build_data, HTML_PAGE
 
 # Logging Setup
 logging.basicConfig(
@@ -29,17 +35,79 @@ TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "").rstrip("/")
 # /health/liveliness).
 HEALTH_PATH = "/" + os.getenv("HEALTH_PATH", "/health").lstrip("/")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", 3600))
-BOOT_WAIT_TIMEOUT = int(os.getenv("BOOT_WAIT_TIMEOUT", 300))
-# Kill switch for the idle auto-shutdown. Power-on still works when disabled;
-# it only stops the proxy from ever shutting the workstation down.
+# Default (per power cycle) for the idle auto-shutdown switch. Power-on
+# still works when disabled; it only stops the proxy from shutting the
+# workstation down. The live per-cycle value lives in state
+# (state["shutdown_enabled"]): the monitor page can toggle it, and every
+# proxy-initiated power-on resets it to this default.
 SHUTDOWN_ENABLED = os.getenv("SHUTDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Max seconds to wait for the next chunk from the target: per-chunk
+# silence for SSE streams, the whole body for non-streaming responses.
+# 0 = no timeout (default) - clients run with no timeout, so a slow model
+# must not become a proxy error. N = cap, to drop a truly hung target.
+# The live value (editable from the monitor page) is in
+# state["target_read_timeout"].
+TARGET_READ_TIMEOUT = max(0, int(os.getenv("TARGET_READ_TIMEOUT", "0")))
+
+# --- Queuing configuration -------------------------------------------------
+# How many distinct sessions may hold a spot (run against the target) at once.
+CONCURRENT_SESSIONS = max(1, int(os.getenv("CONCURRENT_SESSIONS", "1")))
+# Max in-flight requests per session: -1 unlimited (default), N a cap,
+# 0 strictly serialized (one request at a time).
+CONCURRENT_SESSION_REQUESTS = int(os.getenv("CONCURRENT_SESSION_REQUESTS", "-1"))
+# Requests that match no known API: "allow" passes them through unqueued
+# (and lists them on the monitor page), "block" rejects them with 403.
+UNKNOWN_API_POLICY = os.getenv("UNKNOWN_API_POLICY", "allow").lower()
+# Seconds a session stays idle (client-reported, or busy-window based for
+# unknown clients) before its spot is surrendered and the session is
+# forgotten. Future requests with the same id queue at the back as new.
+SESSION_EXPIRY = max(1, int(os.getenv("SESSION_EXPIRY", "300")))
+# Unknown clients have no status API: they are considered busy this long
+# after their last request (a heuristic for in-progress tool calls).
+CLIENT_BUSY_WINDOW = max(0, int(os.getenv("CLIENT_BUSY_WINDOW", "120")))
+# Seconds between polls of known clients' status APIs.
+CLIENT_STATUS_POLL = max(1, int(os.getenv("CLIENT_STATUS_POLL", "5")))
+# Max seconds a request may wait in the queue before being dropped with a
+# 504. 0 = no timeout (default): clients are expected to run with no
+# timeout and simply wait for their turn.
+QUEUE_TIMEOUT = max(0, int(os.getenv("QUEUE_TIMEOUT", "0")))
+# Port of the opencode server probed on each client's source IP
+# (GET /session/status). The client must bind it to a reachable interface.
+OPENCODE_STATUS_PORT = int(os.getenv("OPENCODE_STATUS_PORT", "4096"))
+# Optional basic-auth password for opencode servers (fixed user "opencode").
+OPENCODE_SERVER_PASSWORD = os.getenv("OPENCODE_SERVER_PASSWORD", "")
+# Generic fallback session headers, checked after a known client's own
+# header and before API body fields. Comma separated, case-insensitive.
+SESSION_ID_HEADERS = tuple(
+    h.strip().lower()
+    for h in os.getenv("SESSION_ID_HEADERS", "x-session-id").split(",")
+    if h.strip()
+)
+# How spot-holding sessions share the model:
+#   parallel (default): every spot-holding session may run its in-flight
+#     requests at the same time (up to CONCURRENT_SESSION_REQUESTS each);
+#   atomic: at most ONE in-flight request globally at any moment - the
+#     sessions (and their spots, protecting each K/V cache) may overlap,
+#     but the requests themselves alternate in FIFO order.
+REQUEST_MODE = os.getenv("REQUEST_MODE", "parallel").strip().lower()
+if REQUEST_MODE not in ("parallel", "atomic"):
+    REQUEST_MODE = "parallel"
+# Known clients (e.g. opencode) that truly report "idle" over their status
+# API surrender their spot immediately instead of waiting SESSION_EXPIRY
+# (on by default). Inferred idle (status API unreachable / never reported)
+# and unknown clients keep the normal cooldown.
+IMMEDIATE_IDLE_RELEASE = os.getenv("IMMEDIATE_IDLE_RELEASE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Global Client
 # Using a single AsyncClient globally enables connection pooling, which is critical
 # for a proxy service to minimize latency and avoid socket exhaustion.
 http_client: httpx.AsyncClient = None
 
-# State
 # Central state object to track the physical server status and activity across async tasks.
 #
 # Why time.monotonic() instead of time.time(): the idle timer must measure how long the
@@ -56,10 +124,43 @@ state = {
     "is_powered_on": None,
     "is_healthy": None,
     "manage_power_with_proxy": False,
+    # Live per-power-cycle copy of SHUTDOWN_ENABLED: the monitor page
+    # toggles it for the current cycle, and every proxy-initiated
+    # power-on resets it to the env default (a new cycle starts).
+    "shutdown_enabled": SHUTDOWN_ENABLED,
+    # Live copy of TARGET_READ_TIMEOUT, adjustable at runtime from the
+    # monitor page (applies to new requests only).
+    "target_read_timeout": TARGET_READ_TIMEOUT,
     "last_power_on_attempt": 0,
     "power_on_cooldown": 30,
     "discovered_system_path": "/redfish/v1/Systems/Self" # Hardcoded after discovery of BMC firmware behavior
 }
+
+# Queueing state.
+queue = SessionQueue(
+    max_spots=CONCURRENT_SESSIONS,
+    max_inflight_per_session=CONCURRENT_SESSION_REQUESTS,
+    busy_window=CLIENT_BUSY_WINDOW,
+    session_expiry=SESSION_EXPIRY,
+    atomic_requests=(REQUEST_MODE == "atomic"),
+    immediate_idle_release=IMMEDIATE_IDLE_RELEASE,
+)
+unknown_tracker = UnknownTracker()
+status_poller: StatusPoller = None
+
+PROXY_CONFIG = {
+    "concurrent_sessions": CONCURRENT_SESSIONS,
+    "concurrent_session_requests": CONCURRENT_SESSION_REQUESTS,
+    "request_mode": REQUEST_MODE,
+    "immediate_idle_release": IMMEDIATE_IDLE_RELEASE,
+    "unknown_api_policy": UNKNOWN_API_POLICY,
+    "session_expiry": SESSION_EXPIRY,
+    "client_busy_window": CLIENT_BUSY_WINDOW,
+    "client_status_poll": CLIENT_STATUS_POLL,
+    "queue_timeout": QUEUE_TIMEOUT,
+    "opencode_status_port": OPENCODE_STATUS_PORT,
+}
+
 
 async def redfish_request(method: str, endpoint: str, body: dict = None):
     """
@@ -82,14 +183,15 @@ async def redfish_request(method: str, endpoint: str, body: dict = None):
             response = await http_client.post(url, json=body, timeout=timeout, auth=auth)
         else:
             response = await http_client.get(url, timeout=timeout, auth=auth)
-        
+
         if response.status_code >= 400:
             logger.error(f"IPMI API Error {response.status_code} during {method} {endpoint} (URL: {url}): {response.text}")
-        
+
         return response
     except Exception as e:
         logger.error(f"IPMI Network Error during {method} {endpoint} (URL: {url}): {e}")
         return None
+
 
 async def get_power_state():
     """
@@ -105,12 +207,18 @@ async def get_power_state():
         return data.get("PowerState") == "On"
     return None
 
+
 async def power_on():
     """
     Issues a Redfish command to power on the server.
 
+    A successful power-on starts a new power cycle, so the per-cycle
+    auto power-off switch is reset to its SHUTDOWN_ENABLED default - an
+    override made from the monitor page in the previous cycle no longer
+    applies.
+
     Returns:
-        httpx.Response: The result of the Redfish API call.
+        httpx.Response: The result of the IPMI API call.
     """
     logger.info(f"Triggering IPMI Power On using {state['discovered_system_path']}...")
     endpoint = f"{state['discovered_system_path']}/Actions/ComputerSystem.Reset"
@@ -120,14 +228,17 @@ async def power_on():
         # The proxy initiated this power-on, so it now owns the power lifecycle
         # and is allowed to shut the server down again after idle timeout.
         state["manage_power_with_proxy"] = True
+        # New cycle: the auto power-off switch starts from the env default.
+        state["shutdown_enabled"] = SHUTDOWN_ENABLED
     return res
+
 
 async def power_off():
     """
     Issues a Redfish command for a graceful shutdown of the server.
 
     Returns:
-        httpx.Response: The result of the Redfish API call.
+        httpx.Response: The result of the IPMI API call.
     """
     logger.info(f"Triggering IPMI Graceful Shutdown using {state['discovered_system_path']}...")
     endpoint = f"{state['discovered_system_path']}/Actions/ComputerSystem.Reset"
@@ -138,6 +249,7 @@ async def power_off():
         # back on manually afterwards, the proxy must not shut it down again.
         state["manage_power_with_proxy"] = False
     return res
+
 
 async def check_health():
     """
@@ -159,6 +271,7 @@ async def check_health():
         state["is_healthy"] = False
         return False
 
+
 async def sync_state():
     """
     Synchronizes the internal state with the actual hardware state at startup.
@@ -166,7 +279,7 @@ async def sync_state():
     logger.info("Synchronizing current server state...")
     state["is_healthy"] = await check_health()
     state["is_powered_on"] = await get_power_state()
-    
+
     if state["is_healthy"]:
         logger.info("Server state: ONLINE and HEALTHY")
     elif state["is_powered_on"]:
@@ -176,6 +289,141 @@ async def sync_state():
     else:
         logger.info("Server state: UNKNOWN")
 
+
+def resolve_session_id(request: Request, body: bytes) -> tuple:
+    """
+    Identifies the session for a request. Returns (client_name, session_id)
+    where client_name is a known client ("opencode") or "unknown".
+
+    Precedence:
+      1. a known client's own session headers (for OpenCode:
+         x-opencode-session, or X-Session-Id / x-session-affinity when the
+         client is not using OpenCode's hosted provider),
+      2. a generic configured header (SESSION_ID_HEADERS),
+      3. the API-native body field (OpenAI "user", Anthropic
+         "metadata.user_id"),
+      4. User-Agent + client source IP as a last resort.
+    """
+    lowered = {k.lower(): v for k, v in request.headers.items()}
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = lowered.get("user-agent", "")
+
+    provider = detect_client(lowered)
+    if provider is not None:
+        value = session_header_value(provider, lowered)
+        if value:
+            return provider.name, value
+    for header in SESSION_ID_HEADERS:
+        value = lowered.get(header)
+        if value:
+            return "unknown", value
+    api = detect_api(request.url.path)
+    value = session_id_from_body(api, body)
+    if value is not None:
+        return "unknown", value
+    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
+
+
+def resolve_shared_spot(base: str, session_id: str) -> Optional[tuple]:
+    """
+    Sub-agent spot sharing: walks the cached opencode parentID chain of a
+    session and returns the queue key of the spot it may run on - the spot
+    of the closest tracked ancestor (an ancestor that made requests through
+    the proxy). If that ancestor is itself a sub-agent, the spot it shares
+    is returned instead. None means no sharing: the session needs a spot of
+    its own. Recomputed on every poll; no network I/O (the cache is filled
+    by the status poller).
+    """
+    current = session_id
+    seen = {current}
+    for _ in range(10):  # depth cap; real sub-agent chains are 1-2 levels
+        key = (base, current)
+        if key not in status_poller.session_parent:
+            return None  # chain not resolved yet; retried next poll
+        parent = status_poller.session_parent[key]
+        if not parent or parent in seen:
+            return None
+        seen.add(parent)
+        ancestor = queue.sessions.get(("opencode", parent))
+        if ancestor is not None:
+            if ancestor.key in queue.spots:
+                return ancestor.key
+            if (
+                ancestor.shared_spot_key is not None
+                and ancestor.shared_spot_key in queue.spots
+            ):
+                return ancestor.shared_spot_key
+            return ancestor.key
+        current = parent
+    return None
+
+
+async def forward_request(
+    request: Request, path: str, body: bytes = None, entry: QueueEntry = None
+):
+    """
+    Forwards a request to the target server and streams the response back
+    (SSE-safe). When called with a queue entry, the entry is released
+    exactly once when the response is finished.
+    """
+    if body is None:
+        body = await request.body()
+    headers = dict(request.headers)
+    # Remove host header to prevent the target server from rejecting the request due to host mismatch.
+    headers.pop("host", None)
+    url = f"{TARGET_SERVER_URL}{path}"
+
+    try:
+        # We define the timeout on the Request object.
+        # connect/write/pool are unlimited; the read timeout (TARGET_READ_TIMEOUT,
+        # live in state) bounds the silence from the target - per chunk for SSE
+        # streams, the whole body for non-streaming responses. 0 = no timeout,
+        # so long LLM generations never die at a proxy timeout.
+        read_timeout = state["target_read_timeout"] or None
+        req = http_client.build_request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+            timeout=httpx.Timeout(None, read=read_timeout)
+        )
+
+        response = await http_client.send(req, stream=True)
+
+    except Exception as e:
+        if entry is not None:
+            queue.release(entry, None)
+        logger.error(f"Proxy error: {e}")
+        return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
+
+    async def stream_generator():
+        """
+        Generator to forward raw bytes from the target server to the client.
+        This enables SSE (Server-Sent Events) support for streaming LLM responses.
+        """
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        except httpx.ReadTimeout:
+            logger.error("Read timeout occurred during streaming from AI server")
+            yield b" [Error: Read Timeout] "
+        except Exception as e:
+            logger.error(f"Unexpected error during streaming: {e}")
+            yield f" [Error: {str(e)}] ".encode()
+        finally:
+            # Ensure the connection is closed.
+            await response.aclose()
+            if entry is not None:
+                queue.release(entry, response.status_code)
+            logger.debug(f"Request for {path} finished.")
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=response.status_code,
+        headers=dict(response.headers)
+    )
+
+
 async def idle_monitor():
     """
     Background task that shuts down the server after a period of inactivity.
@@ -183,12 +431,22 @@ async def idle_monitor():
     The server is only shut down if the proxy manages its power lifecycle
     (state["manage_power_with_proxy"]). A server that was turned on manually
     and never used through the proxy is never powered off by this monitor.
+    While the queue has work (queued requests or held spots) the machine is
+    never taken down and the idle timer is restarted.
+
+    The auto power-off switch is per power cycle (state["shutdown_enabled"]):
+    seeded from SHUTDOWN_ENABLED, toggleable from the monitor page, and
+    reset to the env default on every proxy-initiated power-on.
     """
     while True:
         await asyncio.sleep(60)
-        # Auto-shutdown disabled via SHUTDOWN_ENABLED: power-on still works,
-        # we just never take the server down.
-        if not SHUTDOWN_ENABLED:
+        # Auto power-off disabled for this cycle (env default or the
+        # monitor toggle): power-on still works, we just never take the
+        # server down.
+        if not state["shutdown_enabled"]:
+            continue
+        if queue.has_activity():
+            state["last_request_time"] = time.monotonic()
             continue
         elapsed = time.monotonic() - state["last_request_time"]
         if elapsed > IDLE_TIMEOUT:
@@ -207,117 +465,383 @@ async def idle_monitor():
             else:
                 logger.warning("Could not determine power state, skipping shutdown to be safe.")
 
+
+async def queue_manager():
+    """
+    Background task driving the queue:
+
+    1. polls known clients' status APIs (one call per client machine),
+    2. recomputes session statuses and surrenders expired spots,
+    3. while requests wait in the queue: wakes the machine (a single
+       power-on, re-issued on the cooldown if it did not take) and polls
+       the target's health every 2s until it comes up - queued requests
+       simply wait, no 503s are returned,
+    4. promotes waiting requests once the target is healthy.
+    """
+    last_health_check = 0.0
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            last_health_check = await _queue_manager_tick(last_health_check)
+            state["queue_manager_at"] = time.monotonic()
+        except Exception:
+            # A transient error must never kill the manager: without it,
+            # spots are never surrendered, statuses never recompute, and
+            # queued requests are never promoted or woken.
+            logger.exception("Queue manager tick failed; continuing.")
+
+
+async def _queue_manager_tick(last_health_check: float) -> float:
+    now = time.monotonic()
+
+    # 1) Client status polling.
+    bases: dict[str, list] = {}
+    for session in queue.sessions.values():
+        if session.client != "unknown":
+            base = status_poller.base_url(session.client_ip)
+            bases.setdefault(base, []).append(session)
+    for base, sessions in bases.items():
+        if not status_poller.due(base, now):
+            continue
+        # The status map is per-directory (one opencode "instance" per
+        # working directory), so first resolve each session's directory
+        # (GET /session/{id}, cached) and then poll one map per
+        # directory. Unreachable lookups are skipped; tick() keeps each
+        # session's last-known status for the grace period.
+        by_dir: dict[str, list] = {}
+        for session in sessions:
+            key = (base, session.session_id)
+            directory = status_poller.session_dir.get(key)
+            if directory is None:
+                info = await status_poller.fetch_session_info(
+                    base, session.session_id
+                )
+                if info is None:
+                    continue
+                directory, parent_id = info
+                status_poller.session_dir[key] = directory
+                status_poller.session_parent[key] = parent_id
+            by_dir.setdefault(directory, []).append(session)
+            # Sub-agent spot sharing: a session runs on the spot of its
+            # tracked ancestor (recomputed every poll - the ancestor's
+            # spot state changes over time).
+            session.shared_spot_key = resolve_shared_spot(base, session.session_id)
+        for directory, dir_sessions in by_dir.items():
+            data = await status_poller.fetch_statuses(base, directory)
+            # Sessions blocked on a pending permission or question stay
+            # "busy" in the status map, so the pending-request endpoints
+            # are the tie-breaker: a session with a confirmed pending
+            # request is "waiting" no matter what the map says. A failed
+            # poll (None) keeps the last-known state; once the pending
+            # request is gone, the status map applies again on the next
+            # poll (the map shows it as busy or absent).
+            pending = await status_poller.fetch_pending(base, directory)
+            if data is not None or pending is not None:
+                reported = time.monotonic()
+                for session in dir_sessions:
+                    reason = pending.get(session.session_id) if pending is not None else None
+                    if reason is not None:
+                        if session.client_status != "waiting":
+                            logger.info(
+                                f"Session {session.session_id} ({session.client}) "
+                                f"waiting for user input: {reason}."
+                            )
+                        session.client_status = "waiting"
+                        session.client_status_detail = reason
+                        session.client_status_at = reported
+                        continue
+                    if data is None:
+                        continue
+                    st = data.get(session.session_id)
+                    if not isinstance(st, dict):
+                        # A fresh map that lacks this session IS the
+                        # client's idle report: opencode removes idle
+                        # sessions from /session/status entirely.
+                        session.client_status = "idle"
+                        session.client_status_detail = "absent from status map (idle)"
+                        session.client_status_at = reported
+                        continue
+                    stype = st.get("type")
+                    if stype not in ("busy", "idle", "retry"):
+                        continue
+                    session.client_status = stype
+                    session.client_status_at = reported
+                    session.client_status_detail = (
+                        f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
+                    )
+        status_poller.last_poll[base] = time.monotonic()
+        # Forget directory cache entries of sessions that are gone.
+        live = {s.session_id for s in sessions}
+        for key in [k for k in status_poller.session_dir if k[0] == base and k[1] not in live]:
+            status_poller.forget(key[0], key[1])
+
+    # 2) Status recompute + spot surrender.
+    for key, reason in queue.tick(now):
+        logger.info(
+            f"Session {key[1]} ({key[0]}): spot released, session removed ({reason})."
+        )
+
+    # 3) Wake the machine / promote requests while the queue is not empty.
+    if queue.queue:
+        if now - last_health_check >= 2.0:
+            await check_health()
+            last_health_check = now
+        queue.healthy = state["is_healthy"]
+        if not queue.healthy:
+            # The first waiting request triggered the initial power-on
+            # in the request handler; this keeps the single boot cycle
+            # alive (re-issuing on cooldown) while later requests simply
+            # wait their turn.
+            if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
+                await power_on()
+                state["last_power_on_attempt"] = now
+        else:
+            queue._try_promote()
+
+    # 4) Prune stale unknown-API entries.
+    unknown_tracker.prune(now, SESSION_EXPIRY)
+
+    return last_health_check
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     FastAPI lifespan handler for async resource setup and teardown.
     """
-    global http_client
+    global http_client, status_poller
     # verify=False is required because most IPMI/BMC interfaces use self-signed certificates.
     http_client = httpx.AsyncClient(verify=False)
-    
+    status_poller = StatusPoller(
+        http_client,
+        port=OPENCODE_STATUS_PORT,
+        password=OPENCODE_SERVER_PASSWORD,
+        poll_interval=CLIENT_STATUS_POLL,
+    )
+
     await sync_state()
-    
+    queue.healthy = state["is_healthy"]
+
     monitor_task = asyncio.create_task(idle_monitor())
-    logger.info("Idle monitor started.")
+    manager_task = asyncio.create_task(queue_manager())
+    logger.info(
+        f"Queuing enabled: {CONCURRENT_SESSIONS} spot(s), per-session requests={CONCURRENT_SESSION_REQUESTS}, "
+        f"unknown API policy={UNKNOWN_API_POLICY}, session expiry={SESSION_EXPIRY}s, queue timeout={QUEUE_TIMEOUT or 'none'}."
+    )
     yield
-    
-    await http_client.aclose()
+
     monitor_task.cancel()
+    manager_task.cancel()
+    await http_client.aclose()
     logger.info("Idle monitor stopped.")
 
+
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/monitor")
+async def monitor_page():
+    """Simple self-contained monitoring page (polls /monitor/data)."""
+    return HTMLResponse(HTML_PAGE)
+
+
+@app.get("/monitor/data")
+async def monitor_data():
+    """JSON snapshot of configuration, sessions and unknown-API activity."""
+    config = {
+        **PROXY_CONFIG,
+        "target_server_url": TARGET_SERVER_URL,
+        # Live values (editable from the monitor page) plus the static
+        # idle timeout, for context next to the auto power-off switch.
+        "idle_timeout": IDLE_TIMEOUT,
+        "shutdown_enabled": state["shutdown_enabled"],
+        "target_read_timeout": state["target_read_timeout"],
+    }
+    return JSONResponse(build_data(queue, unknown_tracker, config, state))
+
+
+@app.post("/monitor/release")
+async def monitor_release(request: Request):
+    """
+    Manually releases a session's spot before SESSION_EXPIRY elapses
+    (backed by the "release" button on the monitor page).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+    client = data.get("client")
+    session_id = data.get("session")
+    if not client or not session_id:
+        return JSONResponse(status_code=400, content={"error": "Both 'client' and 'session' are required."})
+    if not queue.release_session(str(client), str(session_id)):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Session '{session_id}' ({client}) holds no spot."},
+        )
+    logger.info(f"Spot manually released for session {session_id} ({client}).")
+    return JSONResponse({"released": True})
+
+
+@app.post("/monitor/shutdown")
+async def monitor_shutdown(request: Request):
+    """
+    Toggles the per-power-cycle auto power-off switch (backed by the
+    toggle on the monitor page). It lasts only for the current cycle:
+    the next proxy-initiated power-on resets it to SHUTDOWN_ENABLED.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {enabled}."})
+    if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Expected a JSON body {enabled: true|false}."},
+        )
+    state["shutdown_enabled"] = data["enabled"]
+    logger.info(
+        f"Auto power-off this cycle {'enabled' if data['enabled'] else 'disabled'} from monitor "
+        f"(resets to SHUTDOWN_ENABLED={SHUTDOWN_ENABLED} on the next proxy-initiated power-on)."
+    )
+    return JSONResponse({"shutdown_enabled": data["enabled"]})
+
+
+@app.post("/monitor/timeout")
+async def monitor_timeout(request: Request):
+    """
+    Sets the proxy-to-target read timeout in seconds at runtime (backed
+    by the input + apply button on the monitor page). 0 = no timeout.
+    Applies to new requests only.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {read_timeout}."})
+    value = data.get("read_timeout") if isinstance(data, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Expected a JSON body {read_timeout: N} with N a non-negative integer (0 = no timeout)."},
+        )
+    state["target_read_timeout"] = value
+    logger.info(f"Target read timeout set to {value or 'none'} from monitor.")
+    return JSONResponse({"target_read_timeout": value})
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
     """
-    OpenAI-compatible proxy endpoint that manages server power state.
+    Queueing proxy endpoint.
 
-    This endpoint forwards requests to the target AI server if it is healthy.
-    If the server is off, it triggers a power-on and polls the health endpoint
-    for a configurable timeout before giving up.
+    Requests matching a known API are identified as sessions (per client
+    and API, see resolve_session_id), enqueued FIFO, and held until their
+    session may run (a free spot and the per-session in-flight cap) and the
+    target server is healthy. While the target is off the first waiting
+    request powers it on and all waiting requests simply wait - clients are
+    expected to run without a timeout. A client that hangs up while waiting
+    is dropped from the queue.
+
+    Requests matching no known API are passed through unqueued (and tracked
+    on the monitor page) or rejected, depending on UNKNOWN_API_POLICY.
     """
     state["last_request_time"] = time.monotonic()
-    logger.debug(f"Request received for {path}, resetting idle timer.")
     # Any request routed through the proxy means the proxy is now serving this
     # server, so it adopts power management (even if the server was already on).
-    # This is what makes the idle monitor allowed to shut it down later.
     state["manage_power_with_proxy"] = True
-    
-    # Initial health check and potential power-on trigger
-    if not await check_health():
-        now = time.monotonic()
-        if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
-            await power_on()
-            state["last_power_on_attempt"] = now
-        
-        # Polling loop: wait for the server to become healthy within the BOOT_WAIT_TIMEOUT window
-        start_poll = time.monotonic()
-        while (time.monotonic() - start_poll) < BOOT_WAIT_TIMEOUT:
-            await asyncio.sleep(2)
-            if await check_health():
-                logger.info(f"Server became healthy after {time.monotonic() - start_poll:.1f}s polling.")
-                break
-        
-        # If still unhealthy after polling, return the loading error
-        if not await check_health():
+
+    full_path = "/" + path
+    api = detect_api(full_path)
+
+    if api is None:
+        if UNKNOWN_API_POLICY != "allow":
             return JSONResponse(
-                status_code=503,
+                status_code=403,
                 content={
                     "error": {
-                        "message": "The model is still loading. Please retry in a few moments.",
-                        "type": "server_error",
+                        "message": f"Unknown API path '{full_path}' is blocked (UNKNOWN_API_POLICY=block)",
+                        "type": "policy_error",
                         "param": None,
-                        "code": "model_loading"
+                        "code": "unknown_api_blocked"
                     }
                 }
             )
-
-    # Proceed to proxy the request now that the server is confirmed healthy
-    url = f"{TARGET_SERVER_URL}/{path}"
-    body = await request.body()
-    headers = dict(request.headers)
-    # Remove host header to prevent the target server from rejecting the request due to host mismatch.
-    headers.pop("host", None)
+        lowered = {k.lower(): v for k, v in request.headers.items()}
+        client_ip = request.client.host if request.client else "unknown"
+        unknown_tracker.record(
+            client_ip,
+            lowered.get("user-agent", ""),
+            request.method,
+            full_path,
+            f"{TARGET_SERVER_URL}{full_path}",
+        )
+        return await forward_request(request, full_path)
 
     try:
-        # We define the timeout on the Request object. 
-        # a read timeout of 300s is used to accommodate long LLM generation times.
-        req = http_client.build_request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-            timeout=httpx.Timeout(None, read=300.0)
-        )
-        
-        response = await http_client.send(req, stream=True)
-        
-        async def stream_generator():
-            """
-            Generator to forward raw bytes from the target server to the client.
-            This enables SSE (Server-Sent Events) support for streaming LLM responses.
-            """
-            try:
-                async for chunk in response.aiter_raw():
-                    yield chunk
-            except httpx.ReadTimeout:
-                logger.error("Read timeout occurred during streaming from AI server")
-                yield b" [Error: Read Timeout] "
-            except Exception as e:
-                logger.error(f"Unexpected error during streaming: {e}")
-                yield f" [Error: {str(e)}] ".encode()
-            finally:
-                # Ensure the connection is closed.
-                await response.aclose()
-                logger.debug(f"Request for {path} finished.")
-
-        return StreamingResponse(
-            stream_generator(),
-            status_code=response.status_code,
-            headers=dict(response.headers)
-        )
-
+        body = await request.body()
     except Exception as e:
-        logger.error(f"Proxy error: {e}")
-        return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
+        logger.error(f"Failed to read request body: {e}")
+        return JSONResponse(status_code=400, content={"error": "Failed to read request body."})
+
+    client_name, session_id = resolve_session_id(request, body)
+    lowered = {k.lower(): v for k, v in request.headers.items()}
+    client_ip = request.client.host if request.client else "unknown"
+    session = queue.get_or_create_session(
+        client_name, session_id, api.name, client_ip, lowered.get("user-agent", "")
+    )
+    entry = QueueEntry(
+        session=session,
+        path=full_path,
+        body=body,
+        request=request,
+        enqueued_at=time.monotonic(),
+    )
+
+    # When this request is the first in line, the manager's health
+    # bookkeeping may be stale (it only refreshes while the queue is
+    # non-empty), so do a fresh check before enqueueing: a healthy target
+    # promotes without waiting for the manager tick (same latency profile
+    # as before queuing was added), and a dead one triggers the initial
+    # power-on. While the target is down the queue manager owns the single
+    # boot cycle; the cooldown below de-duplicates it with the manager's
+    # re-issues.
+    if not queue.queue:
+        await check_health()
+        queue.healthy = state["is_healthy"]
+        if not queue.healthy:
+            now = time.monotonic()
+            if now - state["last_power_on_attempt"] > state["power_on_cooldown"]:
+                await power_on()
+                state["last_power_on_attempt"] = now
+
+    queue.enqueue(entry)
+    logger.debug(f"Session {session_id} ({client_name}/{api.name}) queued at position {len(queue.queue)}.")
+
+    result = await queue.wait_for_slot(entry, QUEUE_TIMEOUT or None)
+    if result != "ok":
+        if entry.done:
+            # Lost a race: the entry was promoted in the same instant the
+            # client went away (or the timeout fired). The slot is ours, so
+            # release it rather than abandoning.
+            queue.release(entry, None)
+        else:
+            queue.abandon(entry)
+        if result == "disconnected":
+            logger.info(f"Client {client_ip} hung up while {session_id} was waiting in queue; dropping request.")
+            return JSONResponse(status_code=503, content={"error": "Client disconnected while request was queued."})
+        logger.warning(f"Session {session_id} waited {QUEUE_TIMEOUT}s in queue and timed out; dropping request.")
+        return JSONResponse(
+            status_code=504,
+            content={
+                "error": {
+                    "message": f"Request was held in the queue for {QUEUE_TIMEOUT}s and timed out.",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "queue_timeout"
+                }
+            }
+        )
+
+    return await forward_request(request, full_path, body=body, entry=entry)
