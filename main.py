@@ -1,24 +1,21 @@
-import os
 import asyncio
-import time
-import httpx
 import logging
+import os
+import time
+from contextlib import asynccontextmanager
+
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager
-from typing import Optional
 
 from apis import detect_api, session_id_from_body
-from clients import detect_client, session_header_value, StatusPoller
-from session_queue import SessionQueue, QueueEntry, UnknownTracker
-from monitor import build_data, HTML_PAGE
+from clients import StatusPoller, detect_client, session_header_value
+from monitor import HTML_PAGE, build_data
+from session_queue import QueueEntry, SessionQueue, UnknownTracker
 
 # Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ipmi-proxy")
 
 load_dotenv()
@@ -133,7 +130,8 @@ state = {
     "target_read_timeout": TARGET_READ_TIMEOUT,
     "last_power_on_attempt": 0,
     "power_on_cooldown": 30,
-    "discovered_system_path": "/redfish/v1/Systems/Self" # Hardcoded after discovery of BMC firmware behavior
+    # Hardcoded after discovery of BMC firmware behavior.
+    "discovered_system_path": "/redfish/v1/Systems/Self",
 }
 
 # Queueing state.
@@ -162,7 +160,7 @@ PROXY_CONFIG = {
 }
 
 
-async def redfish_request(method: str, endpoint: str, body: dict = None):
+async def redfish_request(method: str, endpoint: str, body: dict | None = None):
     """
     Executes an authenticated request to the MegaRAC Redfish API.
 
@@ -185,7 +183,14 @@ async def redfish_request(method: str, endpoint: str, body: dict = None):
             response = await http_client.get(url, timeout=timeout, auth=auth)
 
         if response.status_code >= 400:
-            logger.error(f"IPMI API Error {response.status_code} during {method} {endpoint} (URL: {url}): {response.text}")
+            logger.error(
+                "IPMI API Error %s during %s %s (URL: %s): %s",
+                response.status_code,
+                method,
+                endpoint,
+                url,
+                response.text,
+            )
 
         return response
     except Exception as e:
@@ -324,7 +329,7 @@ def resolve_session_id(request: Request, body: bytes) -> tuple:
     return "unknown", f"ua:{user_agent}|ip:{client_ip}"
 
 
-def resolve_shared_spot(base: str, session_id: str) -> Optional[tuple]:
+def resolve_shared_spot(base: str, session_id: str) -> tuple | None:
     """
     Sub-agent spot sharing: walks the cached opencode parentID chain of a
     session and returns the queue key of the spot it may run on - the spot
@@ -348,10 +353,7 @@ def resolve_shared_spot(base: str, session_id: str) -> Optional[tuple]:
         if ancestor is not None:
             if ancestor.key in queue.spots:
                 return ancestor.key
-            if (
-                ancestor.shared_spot_key is not None
-                and ancestor.shared_spot_key in queue.spots
-            ):
+            if ancestor.shared_spot_key is not None and ancestor.shared_spot_key in queue.spots:
                 return ancestor.shared_spot_key
             return ancestor.key
         current = parent
@@ -359,7 +361,10 @@ def resolve_shared_spot(base: str, session_id: str) -> Optional[tuple]:
 
 
 async def forward_request(
-    request: Request, path: str, body: bytes = None, entry: QueueEntry = None
+    request: Request,
+    path: str,
+    body: bytes | None = None,
+    entry: QueueEntry | None = None,
 ):
     """
     Forwards a request to the target server and streams the response back
@@ -369,7 +374,8 @@ async def forward_request(
     if body is None:
         body = await request.body()
     headers = dict(request.headers)
-    # Remove host header to prevent the target server from rejecting the request due to host mismatch.
+    # Remove host header to prevent the target server from rejecting the
+    # request due to host mismatch.
     headers.pop("host", None)
     url = f"{TARGET_SERVER_URL}{path}"
 
@@ -385,7 +391,7 @@ async def forward_request(
             url=url,
             headers=headers,
             content=body,
-            timeout=httpx.Timeout(None, read=read_timeout)
+            timeout=httpx.Timeout(None, read=read_timeout),
         )
 
         response = await http_client.send(req, stream=True)
@@ -394,7 +400,7 @@ async def forward_request(
         if entry is not None:
             queue.release(entry, None)
         logger.error(f"Proxy error: {e}")
-        return JSONResponse(status_code=502, content={"error": f"Proxy error: {str(e)}"})
+        return JSONResponse(status_code=502, content={"error": f"Proxy error: {e!s}"})
 
     async def stream_generator():
         """
@@ -409,7 +415,7 @@ async def forward_request(
             yield b" [Error: Read Timeout] "
         except Exception as e:
             logger.error(f"Unexpected error during streaming: {e}")
-            yield f" [Error: {str(e)}] ".encode()
+            yield f" [Error: {e!s}] ".encode()
         finally:
             # Ensure the connection is closed.
             await response.aclose()
@@ -418,9 +424,7 @@ async def forward_request(
             logger.debug(f"Request for {path} finished.")
 
     return StreamingResponse(
-        stream_generator(),
-        status_code=response.status_code,
-        headers=dict(response.headers)
+        stream_generator(), status_code=response.status_code, headers=dict(response.headers)
     )
 
 
@@ -454,10 +458,16 @@ async def idle_monitor():
             actual_power = await get_power_state()
             if actual_power is True:
                 if state["manage_power_with_proxy"]:
-                    logger.info(f"Server idle for {elapsed:.0f}s. Actual state: ON. Shutting down...")
+                    logger.info(
+                        f"Server idle for {elapsed:.0f}s. Actual state: ON. Shutting down..."
+                    )
                     await power_off()
                 else:
-                    logger.info(f"Server idle for {elapsed:.0f}s but was powered on outside the proxy. Leaving it on.")
+                    logger.info(
+                        "Server idle for %.0fs but was powered on outside the "
+                        "proxy. Leaving it on.",
+                        elapsed,
+                    )
                 # Reset timer to prevent immediate repeated shutdown attempts (or re-polls).
                 state["last_request_time"] = time.monotonic()
             elif actual_power is False:
@@ -513,9 +523,7 @@ async def _queue_manager_tick(last_health_check: float) -> float:
             key = (base, session.session_id)
             directory = status_poller.session_dir.get(key)
             if directory is None:
-                info = await status_poller.fetch_session_info(
-                    base, session.session_id
-                )
+                info = await status_poller.fetch_session_info(base, session.session_id)
                 if info is None:
                     continue
                 directory, parent_id = info
@@ -577,9 +585,7 @@ async def _queue_manager_tick(last_health_check: float) -> float:
 
     # 2) Status recompute + spot surrender.
     for key, reason in queue.tick(now):
-        logger.info(
-            f"Session {key[1]} ({key[0]}): spot released, session removed ({reason})."
-        )
+        logger.info(f"Session {key[1]} ({key[0]}): spot released, session removed ({reason}).")
 
     # 3) Wake the machine / promote requests while the queue is not empty.
     if queue.queue:
@@ -625,8 +631,13 @@ async def lifespan(app: FastAPI):
     monitor_task = asyncio.create_task(idle_monitor())
     manager_task = asyncio.create_task(queue_manager())
     logger.info(
-        f"Queuing enabled: {CONCURRENT_SESSIONS} spot(s), per-session requests={CONCURRENT_SESSION_REQUESTS}, "
-        f"unknown API policy={UNKNOWN_API_POLICY}, session expiry={SESSION_EXPIRY}s, queue timeout={QUEUE_TIMEOUT or 'none'}."
+        "Queuing enabled: %d spot(s), per-session requests=%d, "
+        "unknown API policy=%s, session expiry=%ds, queue timeout=%s.",
+        CONCURRENT_SESSIONS,
+        CONCURRENT_SESSION_REQUESTS,
+        UNKNOWN_API_POLICY,
+        SESSION_EXPIRY,
+        QUEUE_TIMEOUT or "none",
     )
     yield
 
@@ -669,13 +680,19 @@ async def monitor_release(request: Request):
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+        return JSONResponse(
+            status_code=400, content={"error": "Expected a JSON body {client, session}."}
+        )
     if not isinstance(data, dict):
-        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {client, session}."})
+        return JSONResponse(
+            status_code=400, content={"error": "Expected a JSON body {client, session}."}
+        )
     client = data.get("client")
     session_id = data.get("session")
     if not client or not session_id:
-        return JSONResponse(status_code=400, content={"error": "Both 'client' and 'session' are required."})
+        return JSONResponse(
+            status_code=400, content={"error": "Both 'client' and 'session' are required."}
+        )
     if not queue.release_session(str(client), str(session_id)):
         return JSONResponse(
             status_code=404,
@@ -719,12 +736,19 @@ async def monitor_timeout(request: Request):
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "Expected a JSON body {read_timeout}."})
+        return JSONResponse(
+            status_code=400, content={"error": "Expected a JSON body {read_timeout}."}
+        )
     value = data.get("read_timeout") if isinstance(data, dict) else None
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return JSONResponse(
             status_code=400,
-            content={"error": "Expected a JSON body {read_timeout: N} with N a non-negative integer (0 = no timeout)."},
+            content={
+                "error": (
+                    "Expected a JSON body {read_timeout: N} with N a non-negative "
+                    "integer (0 = no timeout)."
+                )
+            },
         )
     state["target_read_timeout"] = value
     logger.info(f"Target read timeout set to {value or 'none'} from monitor.")
@@ -761,12 +785,14 @@ async def proxy(request: Request, path: str):
                 status_code=403,
                 content={
                     "error": {
-                        "message": f"Unknown API path '{full_path}' is blocked (UNKNOWN_API_POLICY=block)",
+                        "message": (
+                            f"Unknown API path '{full_path}' is blocked (UNKNOWN_API_POLICY=block)"
+                        ),
                         "type": "policy_error",
                         "param": None,
-                        "code": "unknown_api_blocked"
+                        "code": "unknown_api_blocked",
                     }
-                }
+                },
             )
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
@@ -817,7 +843,9 @@ async def proxy(request: Request, path: str):
                 state["last_power_on_attempt"] = now
 
     queue.enqueue(entry)
-    logger.debug(f"Session {session_id} ({client_name}/{api.name}) queued at position {len(queue.queue)}.")
+    logger.debug(
+        f"Session {session_id} ({client_name}/{api.name}) queued at position {len(queue.queue)}."
+    )
 
     result = await queue.wait_for_slot(entry, QUEUE_TIMEOUT or None)
     if result != "ok":
@@ -829,9 +857,19 @@ async def proxy(request: Request, path: str):
         else:
             queue.abandon(entry)
         if result == "disconnected":
-            logger.info(f"Client {client_ip} hung up while {session_id} was waiting in queue; dropping request.")
-            return JSONResponse(status_code=503, content={"error": "Client disconnected while request was queued."})
-        logger.warning(f"Session {session_id} waited {QUEUE_TIMEOUT}s in queue and timed out; dropping request.")
+            logger.info(
+                "Client %s hung up while %s was waiting in queue; dropping request.",
+                client_ip,
+                session_id,
+            )
+            return JSONResponse(
+                status_code=503, content={"error": "Client disconnected while request was queued."}
+            )
+        logger.warning(
+            "Session %s waited %ss in queue and timed out; dropping request.",
+            session_id,
+            QUEUE_TIMEOUT,
+        )
         return JSONResponse(
             status_code=504,
             content={
@@ -839,9 +877,9 @@ async def proxy(request: Request, path: str):
                     "message": f"Request was held in the queue for {QUEUE_TIMEOUT}s and timed out.",
                     "type": "server_error",
                     "param": None,
-                    "code": "queue_timeout"
+                    "code": "queue_timeout",
                 }
-            }
+            },
         )
 
     return await forward_request(request, full_path, body=body, entry=entry)

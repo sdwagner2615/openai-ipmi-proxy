@@ -57,14 +57,14 @@ call until a human acts, so there is no cache to protect.
 """
 
 import asyncio
+import contextlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
 
 from clients import STATUS_UNREACHABLE_GRACE
 
-__all__ = ["Session", "QueueEntry", "SessionQueue", "UnknownTracker"]
+__all__ = ["QueueEntry", "Session", "SessionQueue", "UnknownTracker"]
 
 
 @dataclass
@@ -86,13 +86,13 @@ class Session:
     spot_acquired_at: float = 0.0
     # Sub-agent spot sharing: the queue key of the tracked ancestor whose
     # spot this session runs on (None when it holds its own spot or none).
-    shared_spot_key: Optional[tuple] = None
-    idle_since: Optional[float] = None
+    shared_spot_key: tuple | None = None
+    idle_since: float | None = None
     # Last state learned from the client's status API (known clients only):
     # "busy" / "retry" from the status map, "idle" when a fresh poll lacks
     # the session (opencode's idle report), "waiting" when it is blocked on
     # a pending permission or question (detail carries which).
-    client_status: Optional[str] = None
+    client_status: str | None = None
     client_status_detail: str = ""
     client_status_at: float = 0.0
 
@@ -181,7 +181,7 @@ class SessionQueue:
         self.queue.append(entry)
         self._try_promote()
 
-    def _spot_key(self, session: Session) -> Optional[tuple]:
+    def _spot_key(self, session: Session) -> tuple | None:
         """
         The spot this session runs on: its own, or - for a sub-agent - the
         spot of the tracked ancestor it is sharing. None when the session
@@ -244,10 +244,8 @@ class SessionQueue:
     def _remove_waiting(self, entry: QueueEntry) -> None:
         if entry.done:
             return
-        try:
+        with contextlib.suppress(ValueError):
             self.queue.remove(entry)
-        except ValueError:
-            pass
         entry.session.waiting = max(0, entry.session.waiting - 1)
 
     def abandon(self, entry: QueueEntry) -> None:
@@ -269,7 +267,7 @@ class SessionQueue:
         self._release_spot(session, key)
         return True
 
-    def release(self, entry: QueueEntry, status_code: Optional[int]) -> None:
+    def release(self, entry: QueueEntry, status_code: int | None) -> None:
         """
         Called exactly once when an in-flight request finishes (the
         status_code is kept for future use; status is otherwise driven by
@@ -282,7 +280,7 @@ class SessionQueue:
         session.last_request_at = time.monotonic()
         self._try_promote()
 
-    async def wait_for_slot(self, entry: QueueEntry, timeout: Optional[float]) -> str:
+    async def wait_for_slot(self, entry: QueueEntry, timeout: float | None) -> str:
         """
         Blocks until the entry is promoted ("ok"), its client goes away
         ("disconnected"), or the queue hold timeout elapses ("timed_out").
@@ -327,7 +325,7 @@ class SessionQueue:
             and now - session.client_status_at < STATUS_UNREACHABLE_GRACE
         )
 
-    def _release_deadline(self, session: Session, now: float) -> Optional[float]:
+    def _release_deadline(self, session: Session, now: float) -> float | None:
         """Monotonic deadline at which the session's spot is surrendered."""
         if session.inflight > 0:
             return None
@@ -430,7 +428,7 @@ class SessionQueue:
                 ordered.append(session)
         # Sub-agents running on a shared spot hold no spot of their own and
         # may have nothing waiting - they are still active and must be listed.
-        for key, session in list(self.sessions.items()):
+        for session in list(self.sessions.values()):
             if (
                 session.shared_spot_key is not None
                 and session.shared_spot_key in self.spots
@@ -488,9 +486,7 @@ class UnknownTracker:
     def __init__(self):
         self.entries: dict[tuple, dict] = {}
 
-    def record(
-        self, ip: str, user_agent: str, method: str, path: str, target_url: str
-    ) -> None:
+    def record(self, ip: str, user_agent: str, method: str, path: str, target_url: str) -> None:
         key = (ip, user_agent or "-")
         now = time.monotonic()
         entry = self.entries.get(key)
@@ -513,11 +509,7 @@ class UnknownTracker:
             entry["count"] += 1
 
     def prune(self, now: float, expiry: float) -> None:
-        for key in [
-            k
-            for k, e in self.entries.items()
-            if now - e["last_at"] >= expiry
-        ]:
+        for key in [k for k, e in self.entries.items() if now - e["last_at"] >= expiry]:
             del self.entries[key]
 
     def snapshot(self, now: float) -> list:

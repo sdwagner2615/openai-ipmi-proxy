@@ -11,11 +11,11 @@ a matter of appending one profile below.
 
 import json
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 __all__ = [
-    "APIProfile",
     "API_PROFILES",
+    "APIProfile",
     "detect_api",
     "extract_body_field",
     "session_id_from_body",
@@ -37,14 +37,14 @@ API_PROFILES: tuple[APIProfile, ...] = (
 )
 
 
-def detect_api(path: str) -> Optional[APIProfile]:
+def detect_api(path: str) -> APIProfile | None:
     """
     Returns the API profile for a request path (with or without leading
     slash), or None when no known API matches.
     """
     if not path.startswith("/"):
         path = "/" + path
-    best: Optional[APIProfile] = None
+    best: APIProfile | None = None
     best_len = -1
     for profile in API_PROFILES:
         for prefix in profile.path_prefixes:
@@ -53,7 +53,7 @@ def detect_api(path: str) -> Optional[APIProfile]:
     return best
 
 
-def extract_body_field(body: bytes, dotted_path: str) -> Optional[str]:
+def extract_body_field(body: bytes, dotted_path: str) -> str | None:
     """
     Walks a dotted path (e.g. "metadata.user_id") into a JSON body.
     Returns the value as a string when it is a non-empty string, else None.
@@ -74,7 +74,7 @@ def extract_body_field(body: bytes, dotted_path: str) -> Optional[str]:
     return None
 
 
-def session_id_from_body(profile: Optional[APIProfile], body: bytes) -> Optional[str]:
+def session_id_from_body(profile: APIProfile | None, body: bytes) -> str | None:
     """
     Tries the profile's body sources in order and returns the first
     non-empty value found.

@@ -11,7 +11,7 @@ POST /monitor/timeout  -> set the proxy-to-target read timeout (0 = none).
 
 import time
 
-__all__ = ["build_data", "HTML_PAGE"]
+__all__ = ["HTML_PAGE", "build_data"]
 
 
 def build_data(queue, unknown_tracker, config: dict, state: dict) -> dict:

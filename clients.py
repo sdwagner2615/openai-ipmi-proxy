@@ -45,14 +45,13 @@ The client must therefore run its opencode server on a reachable interface
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 from urllib.parse import quote
 
 import httpx
 
 logger = logging.getLogger("ipmi-proxy.clients")
 
-__all__ = ["ClientProvider", "CLIENT_PROVIDERS", "detect_client", "StatusPoller"]
+__all__ = ["CLIENT_PROVIDERS", "ClientProvider", "StatusPoller", "detect_client"]
 
 # Grace period (seconds) a session keeps its last known status when the
 # client's status API becomes unreachable or stops reporting the session
@@ -99,7 +98,7 @@ OPENCODE = ClientProvider(
 CLIENT_PROVIDERS: tuple[ClientProvider, ...] = (OPENCODE,)
 
 
-def detect_client(headers: dict) -> Optional[ClientProvider]:
+def detect_client(headers: dict) -> ClientProvider | None:
     """
     Returns the provider for a request's headers (case-insensitive), or
     None for clients without a known provider.
@@ -118,7 +117,7 @@ def detect_client(headers: dict) -> Optional[ClientProvider]:
     return None
 
 
-def session_header_value(provider: ClientProvider, headers: dict) -> Optional[str]:
+def session_header_value(provider: ClientProvider, headers: dict) -> str | None:
     """The first non-empty session header value for a provider, else None."""
     lowered = {k.lower(): v for k, v in headers.items()}
     for header in provider.session_headers + provider.gated_session_headers:
@@ -157,7 +156,7 @@ class StatusPoller:
         # never changes, so entries live until the session is gone.
         self.session_dir: dict[tuple, str] = {}
         # (base, session-id) -> parent session id (None = not a sub-agent).
-        self.session_parent: dict[tuple, Optional[str]] = {}
+        self.session_parent: dict[tuple, str | None] = {}
 
     def base_url(self, client_ip: str) -> str:
         return f"http://{client_ip}:{self.port}"
@@ -169,7 +168,7 @@ class StatusPoller:
         self.session_dir.pop((base, session_id), None)
         self.session_parent.pop((base, session_id), None)
 
-    async def fetch_session_info(self, base: str, session_id: str) -> Optional[tuple]:
+    async def fetch_session_info(self, base: str, session_id: str) -> tuple | None:
         """
         Resolves a session's (working directory, parent session id) via
         GET /session/{id}. The parent id is None for regular sessions and
@@ -179,14 +178,16 @@ class StatusPoller:
         """
         url = f"{base}{OPENCODE.session_path}/{quote(session_id, safe='')}"
         try:
-            response = await self.http_client.get(
-                url, timeout=self.timeout, auth=self.auth
-            )
+            response = await self.http_client.get(url, timeout=self.timeout, auth=self.auth)
             if response.status_code != 200:
                 logger.debug("Session lookup %s: HTTP %s", url, response.status_code)
                 return None
             data = response.json()
-            if not isinstance(data, dict) or not isinstance(data.get("directory"), str) or not data["directory"]:
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("directory"), str)
+                or not data["directory"]
+            ):
                 return None
             parent = data.get("parentID")
             return data["directory"], (parent if isinstance(parent, str) and parent else None)
@@ -194,7 +195,7 @@ class StatusPoller:
             logger.debug("Session lookup %s failed: %s", url, e)
             return None
 
-    async def fetch_statuses(self, base: str, directory: Optional[str]) -> Optional[dict]:
+    async def fetch_statuses(self, base: str, directory: str | None) -> dict | None:
         """
         GETs the status map for one client base and directory. Returns a
         dict of session-id -> status-object, or None when the client is
@@ -218,7 +219,7 @@ class StatusPoller:
             logger.debug("Status poll %s failed: %s", url, e)
             return None
 
-    async def fetch_pending(self, base: str, directory: Optional[str]) -> Optional[dict]:
+    async def fetch_pending(self, base: str, directory: str | None) -> dict | None:
         """
         GETs the pending user-input endpoints (permission / question) for
         one client base and directory. Returns {session-id: kind} for the

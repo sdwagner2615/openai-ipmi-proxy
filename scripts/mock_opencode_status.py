@@ -51,8 +51,7 @@ async def permission_list(directory: str = Query(default="")):
     if directory != MOCK_DIR:
         return []
     return [
-        {"id": f"per_{sid}", "sessionID": sid, "permission": "edit"}
-        for sid in pending_permissions
+        {"id": f"per_{sid}", "sessionID": sid, "permission": "edit"} for sid in pending_permissions
     ]
 
 
@@ -72,10 +71,7 @@ async def permission_set(sid: str = Query(...)):
 async def question_list(directory: str = Query(default="")):
     if directory != MOCK_DIR:
         return []
-    return [
-        {"id": f"que_{sid}", "sessionID": sid, "questions": []}
-        for sid in pending_questions
-    ]
+    return [{"id": f"que_{sid}", "sessionID": sid, "questions": []} for sid in pending_questions]
 
 
 @app.delete("/question")

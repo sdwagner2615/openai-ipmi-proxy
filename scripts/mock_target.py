@@ -30,6 +30,7 @@ async def health():
 async def chat(request: Request):
     body = await request.json()
     if body.get("stream"):
+
         async def gen():
             for i in range(5):
                 await asyncio.sleep(DELAY / 5)
@@ -40,9 +41,7 @@ async def chat(request: Request):
     await asyncio.sleep(DELAY)
     return {
         "id": "mock",
-        "choices": [
-            {"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}
-        ],
+        "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
     }
 
 
