@@ -1,0 +1,131 @@
+# relay — topology + policy. Secrets come from the environment via ${VAR}.
+#
+#   cp config.yaml.sample config.yaml     (then edit)
+#   cp .env.sample .env                   (non-secret operational values)
+#   cp secrets.env.sample secrets.env     (secrets; never committed)
+#
+# The live config.yaml is gitignored: it carries internal topology
+# (addresses, instance IDs).
+
+proxy:
+  host: 0.0.0.0                # bind address
+  port: 8000                   # bind port
+  unknown_path_policy: allow   # allow -> route unmatched paths to the catch_all
+                               # endpoint (passthrough, tracked); block -> 403
+  target_read_timeout: 0       # seconds to wait for the next chunk from a target
+                               # (per-chunk for SSE, whole body otherwise); 0 = none.
+                               # Live-tunable from the monitor (new requests only).
+  session_id_headers:          # generic fallback session headers (D22 step 2),
+    - x-session-id             # checked in order
+  store:
+    path: ${RELAY_DB_PATH}     # SQLite file (default ./relay.db)
+    retention_days: 90         # prune requests/sessions/power_events older than this
+
+servers:
+  - name: gpu-workstation      # unique
+    type: redfish              # redfish | aws-ec2 | noop
+    power:
+      host: ${IPMI_HOST}
+      user: ${IPMI_USER}
+      password: ${IPMI_PASS}
+      # base_url: http://127.0.0.1:8000
+      #   Optional full base URL; defaults to https://<host>. Use it for a
+      #   plain-HTTP BMC (e.g. a test mock).
+      system_path: /redfish/v1/Systems/Self   # default; the old hardcoded
+                                              # discovered_system_path
+      verify_ssl: false        # BMCs use self-signed certs; default false
+    service_url: http://192.168.1.186:80      # base URL of the service(s) on it
+    idle_timeout: 3600         # seconds: sleep when ALL endpoints idle
+    shutdown_enabled: true     # per-cycle default for the auto-off switch
+    adopt_on_traffic: true     # routed traffic grants power ownership
+    # schedule: "0 2 * * *"    # 5-field cron off-time (Phase 1); defers while
+                               # active; null/omitted = no schedule
+    #
+    # Example: AWS EC2 server (Phase 2 — requires the `relay[aws]` extra):
+    #
+    # - name: ec2-gpu
+    #   type: aws-ec2
+    #   power:
+    #     region: us-east-1
+    #     instance_id: i-0abcdef
+    #     access_key: ${AWS_ACCESS_KEY_ID}
+    #     secret_key: ${AWS_SECRET_ACCESS_KEY}
+    #     # session_token: ${AWS_SESSION_TOKEN}   # optional
+    #     # profile: my-aws-profile               # alternative to explicit keys
+    #     off_action: stop             # stop (default) | terminate
+    #   service_url: http://10.0.0.5:80
+    #   idle_timeout: 1800
+    #   shutdown_enabled: true
+    #   adopt_on_traffic: true
+    #
+    # Example: dev/test server with no real hardware:
+    #
+    # - name: local-dev
+    #   type: noop
+    #   power:
+    #     initial_state: on        # on | off
+    #   service_url: http://127.0.0.1:8100
+    #   idle_timeout: 3600
+    #   shutdown_enabled: false
+
+endpoints:
+  - name: llama-cpp            # unique
+    server: gpu-workstation    # must reference a configured server
+    path_prefix: /v1           # must start with /
+    catch_all: true            # at most ONE per platform; unmatched paths
+                               # route here with passthrough semantics
+    readiness:
+      path: /health            # probed on service_url
+      # method: GET            # default GET
+      # interval: 5            # seconds between probes (default 5)
+      # timeout: 2             # probe timeout seconds (default 2)
+      # healthy_statuses: [200]
+    wait_policy: wait          # wait (hold until ready) | error (503 + retry)
+    routing: queued            # queued | concurrent | passthrough
+    concurrency: 1             # slots; required (>= 1) when routing=queued
+    queue_timeout: 0           # seconds a request may wait before 504; 0 = none
+    session_id_body_fields:    # dotted JSON body paths that may carry a
+      - user                   # session id (OpenAI-style), tried in order
+    session:
+      per_session_requests: -1 # -1 unlimited (default), N cap, 0 serialized
+      request_mode: parallel   # parallel (default) | atomic (one in-flight
+                               # request at a time within this endpoint)
+      busy_window: 120         # seconds unknown clients count as busy after
+                               # their last request
+      expiry: 300              # seconds a session may stay idle before its
+                               # slot is surrendered and it is forgotten
+      immediate_idle_release: true   # known clients that truly report idle
+                                     # surrender their slot immediately
+    #
+    # Example: a second endpoint (Anthropic Messages) on the same server —
+    # the longer prefix wins over /v1:
+    #
+    # - name: anthropic
+    #   server: gpu-workstation
+    #   path_prefix: /v1/messages
+    #   readiness:
+    #     path: /health
+    #   routing: queued
+    #   concurrency: 1
+    #   session_id_body_fields:
+    #     - metadata.user_id
+
+clients:
+  - name: opencode             # white-glove client
+    match:
+      ua_prefix: opencode/
+      session_headers: [x-opencode-session]            # identifies alone
+      gated_session_headers: [x-session-affinity, x-session-id]
+                                                # identify only when UA matches
+    status:
+      kind: opencode           # status-source plugin: opencode | none
+      port: 4096               # probed on the client's SOURCE IP
+      password: ${OPENCODE_SERVER_PASSWORD}   # optional basic auth (user
+                                              # "opencode"); empty = no auth
+      poll_interval: 5         # seconds between status polls per client machine
+      # status_path: /session/status
+      # session_path: /session
+      # pending_paths: [/permission, /question]
+    children:
+      kind: parent-chain       # child sessions share a tracked ancestor's slot
+      depth: 10                # chain walk cap

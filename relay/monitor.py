@@ -1,34 +1,74 @@
-"""
-Monitoring page for the queue.
+"""Monitoring page + data snapshot (v1, M1/M6).
 
 GET  /monitor          -> single self-contained HTML page (no external
                           assets), polls the JSON endpoint every 2 seconds.
 GET  /monitor/data     -> JSON snapshot of configuration, known sessions
-                          (in queue order) and unknown-API sessions.
+                          (in queue order) and unknown/passthrough activity.
+POST /monitor/release  -> manually release a session's spot.
 POST /monitor/shutdown -> toggle the per-power-cycle auto power-off switch.
 POST /monitor/timeout  -> set the proxy-to-target read timeout (0 = none).
+
+This is the v1 monitor (parity surface); Phase 1 adds the server/endpoint-
+aware v2 (servers table, endpoints table, manual power, recent events).
+No authentication (D7: trusted network, documented).
 """
 
 import time
 
+from relay.power.base import PowerState
+
 __all__ = ["HTML_PAGE", "build_data"]
 
 
-def build_data(queue, unknown_tracker, config: dict, state: dict) -> dict:
+def build_data(app) -> dict:
+    """The /monitor/data snapshot (``app`` is the RelayApp, duck-typed)."""
     now = time.monotonic()
-    manager_at = state.get("queue_manager_at")
+    sessions = []
+    for endpoint in app.endpoints.values():
+        sessions.extend(endpoint.queue.snapshot(now))
+    if app.endpoints:
+        manager_at = max((ep.last_manager_tick or 0.0) for ep in app.endpoints.values())
+    else:
+        manager_at = None
+    primary = app.catch_all or next(iter(app.endpoints.values()), None)
+    server = next(iter(app.servers.values()), None)
+    config = {
+        "concurrent_sessions": primary.config.concurrency if primary else None,
+        "concurrent_session_requests": (
+            primary.config.session.per_session_requests if primary else None
+        ),
+        "request_mode": primary.config.session.request_mode if primary else None,
+        "immediate_idle_release": (
+            primary.config.session.immediate_idle_release if primary else None
+        ),
+        "unknown_path_policy": app.config.proxy.unknown_path_policy,
+        "session_expiry": primary.config.session.expiry if primary else None,
+        "client_busy_window": primary.config.session.busy_window if primary else None,
+        "client_status_poll": (
+            app.config.clients[0].status.poll_interval if app.config.clients else None
+        ),
+        "queue_timeout": primary.config.queue_timeout if primary else None,
+        "target_server_url": server.config.service_url if server else None,
+        "idle_timeout": server.config.idle_timeout if server else None,
+        "shutdown_enabled": server.shutdown_enabled_now if server else None,
+        "target_read_timeout": app.target_read_timeout,
+        "server_powered_on": (
+            None
+            if server is None or server.power_state is PowerState.UNKNOWN
+            else server.power_state is PowerState.ON
+        ),
+        "server_healthy": (
+            None if primary is None or primary.last_check_at is None else primary.queue.ready
+        ),
+        "power_managed": server.owned if server else None,
+        "queue_manager_age": round(now - manager_at, 1) if manager_at else None,
+        "active_sessions": sum(len(ep.queue.spots) for ep in app.endpoints.values()),
+        "queued_requests": sum(len(ep.queue.queue) for ep in app.endpoints.values()),
+    }
     return {
-        "config": {
-            **config,
-            "server_powered_on": state.get("is_powered_on"),
-            "server_healthy": state.get("is_healthy"),
-            "power_managed": state.get("manage_power_with_proxy"),
-            "queue_manager_age": round(now - manager_at, 1) if manager_at else None,
-            "active_sessions": len(queue.spots),
-            "queued_requests": len(queue.queue),
-        },
-        "sessions": queue.snapshot(now),
-        "unknown": unknown_tracker.snapshot(now),
+        "config": config,
+        "sessions": sessions,
+        "unknown": app.unknown_tracker.snapshot(now),
     }
 
 
@@ -36,7 +76,7 @@ HTML_PAGE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>IPMI Proxy Monitor</title>
+<title>Relay Monitor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -76,7 +116,7 @@ HTML_PAGE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>IPMI Proxy Monitor <span id="updated"></span></h1>
+<h1>Relay Monitor <span id="updated"></span></h1>
 <div id="config" class="kv"></div>
 <h2>Sessions (queue order)</h2>
 <div class="tablewrap">
@@ -90,7 +130,7 @@ HTML_PAGE = """<!doctype html>
   <tbody></tbody>
 </table>
 </div>
-<h2>Unknown API sessions</h2>
+<h2>Unknown / passthrough sessions</h2>
 <div class="tablewrap">
 <table id="unknown">
   <thead><tr>
@@ -113,7 +153,7 @@ function render(d) {
       return '<div><b>auto power-off this cycle:</b> <span class="status '
         + (on ? 'idle' : 'retry') + '">' + (on ? 'on' : 'off') + '</span>'
         + ' <span class="muted">after ' + esc(d.config.idle_timeout ?? 'unknown')
-        + 's idle; resets to SHUTDOWN_ENABLED on the next power-on</span> '
+        + 's idle; resets to the config default on the next power-on</span> '
         + '<button class="toggle" id="shutdown-toggle" data-on="' + (on ? 'on' : 'off') + '" '
         + 'title="Toggle automatic shutdown for the current power cycle">'
         + (on ? 'off' : 'on') + '</button></div>';
