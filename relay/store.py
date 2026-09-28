@@ -10,6 +10,7 @@ asyncio loop (WAL mode allows concurrent readers during writes).
 import asyncio
 import logging
 import time
+from typing import Any
 
 import aiosqlite
 
@@ -83,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_endpoint    ON requests(endpoint, ts);
 CREATE INDEX IF NOT EXISTS idx_power_events_server  ON power_events(server, ts);
 """
 
-_UNSET = object()
+_UNSET: Any = object()
 
 
 class ServerRuntimeRow:
@@ -125,11 +126,12 @@ class Store:
         return self._db
 
     async def open(self) -> None:
-        self._db = await aiosqlite.connect(self._path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.executescript(SCHEMA)
-        await self._db.commit()
+        db = await aiosqlite.connect(self._path)
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.executescript(SCHEMA)
+        await db.commit()
+        self._db = db
 
     async def close(self) -> None:
         if self._db is not None:
@@ -153,22 +155,29 @@ class Store:
         """
         rows: dict[str, ServerRuntimeRow] = {}
         now = time.time()
+        db = self.db
         async with self._write_lock:
             for name in names:
-                cursor = await self._db.execute(
+                cursor = await db.execute(
                     "SELECT power_state, owned, shutdown_override, cycle_id, updated_at "
                     "FROM server_runtime WHERE name = ?",
                     (name,),
                 )
                 row = await cursor.fetchone()
                 if row is None:
-                    await self._db.execute(
+                    await db.execute(
                         "INSERT INTO server_runtime "
                         "(name, power_state, owned, shutdown_override, updated_at) "
                         "VALUES (?, 'unknown', 0, NULL, ?)",
                         (name, now),
                     )
-                    row = ("unknown", 0, None, None, now)
+                    cursor = await db.execute(
+                        "SELECT power_state, owned, shutdown_override, cycle_id, "
+                        "updated_at FROM server_runtime WHERE name = ?",
+                        (name,),
+                    )
+                    row = await cursor.fetchone()
+                    assert row is not None  # just inserted
                 power_state, owned, override, cycle_id, updated_at = row
                 rows[name] = ServerRuntimeRow(
                     name=name,
@@ -178,7 +187,7 @@ class Store:
                     cycle_id=cycle_id,
                     updated_at=updated_at,
                 )
-            await self._db.commit()
+            await db.commit()
         return rows
 
     async def set_server_runtime(
@@ -187,8 +196,8 @@ class Store:
         *,
         power_state: str | None = None,
         owned: bool | None = None,
-        shutdown_override: bool | object | None = _UNSET,
-        cycle_id: str | object | None = _UNSET,
+        shutdown_override: Any = _UNSET,
+        cycle_id: Any = _UNSET,
     ) -> None:
         """Persists part of a server's runtime state (reconcile first)."""
         sets: list[str] = []
@@ -207,16 +216,17 @@ class Store:
             args.append(cycle_id)
         if not sets:
             return
+        db = self.db
         sets.append("updated_at = ?")
         args.append(time.time())
         args.append(name)
         async with self._write_lock:
-            cursor = await self._db.execute(
+            cursor = await db.execute(
                 f"UPDATE server_runtime SET {', '.join(sets)} WHERE name = ?", args
             )
             if cursor.rowcount == 0:
                 logger.warning("set_server_runtime: no row for server %r", name)
-            await self._db.commit()
+            await db.commit()
 
     # -- endpoint_runtime ------------------------------------------------------
 
@@ -228,8 +238,9 @@ class Store:
         ready_since: float | None,
         last_check_at: float | None,
     ) -> None:
+        db = self.db
         async with self._write_lock:
-            await self._db.execute(
+            await db.execute(
                 "INSERT INTO endpoint_runtime (name, ready, ready_since, last_check_at) "
                 "VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET "
@@ -237,10 +248,11 @@ class Store:
                 "last_check_at = excluded.last_check_at",
                 (name, int(ready), ready_since, last_check_at),
             )
-            await self._db.commit()
+            await db.commit()
 
     async def get_endpoint_runtime(self) -> dict[str, tuple[bool, float | None]]:
-        cursor = await self._db.execute("SELECT name, ready, ready_since FROM endpoint_runtime")
+        db = self.db
+        cursor = await db.execute("SELECT name, ready, ready_since FROM endpoint_runtime")
         rows = await cursor.fetchall()
         return {name: (bool(ready), ready_since) for name, ready, ready_since in rows}
 
@@ -249,21 +261,23 @@ class Store:
     async def log_power_event(
         self, server: str, action: str, reason: str, initiated_by: str, success: bool
     ) -> None:
+        db = self.db
         async with self._write_lock:
-            await self._db.execute(
+            await db.execute(
                 "INSERT INTO power_events (ts, server, action, reason, initiated_by, success) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (time.time(), server, action, reason, initiated_by, int(success)),
             )
-            await self._db.commit()
+            await db.commit()
 
     async def recent_power_events(self, limit: int = 50) -> list[dict]:
-        cursor = await self._db.execute(
+        db = self.db
+        cursor = await db.execute(
             "SELECT ts, server, action, reason, initiated_by, success "
             "FROM power_events ORDER BY id DESC LIMIT ?",
             (limit,),
         )
-        rows = await cursor.fetchall()
+        rows = list(await cursor.fetchall())
         return [
             {
                 "ts": ts,
@@ -273,7 +287,7 @@ class Store:
                 "initiated_by": initiated_by,
                 "success": bool(success),
             }
-            for ts, server, action, reason, initiated_by, success in reversed(rows)
+            for ts, server, action, reason, initiated_by, success in rows[::-1]
         ]
 
     # -- requests / sessions (written from Phase 1 onward) ---------------------
@@ -291,8 +305,9 @@ class Store:
         request_bytes: int,
         response_bytes: int,
     ) -> None:
+        db = self.db
         async with self._write_lock:
-            await self._db.execute(
+            await db.execute(
                 "INSERT INTO requests "
                 "(ts, server, endpoint, client, session_id, wait_seconds, "
                 " active_seconds, status_code, request_bytes, response_bytes) "
@@ -310,7 +325,7 @@ class Store:
                     response_bytes,
                 ),
             )
-            await self._db.commit()
+            await db.commit()
 
     # -- retention -------------------------------------------------------------
 
@@ -323,11 +338,12 @@ class Store:
         cutoff = time.time() - retention_days * 86400
         batch = 10_000
         deleted: dict[str, int] = {}
+        db = self.db
         async with self._write_lock:
             for table in ("requests", "power_events"):
                 total = 0
                 while True:
-                    cursor = await self._db.execute(
+                    cursor = await db.execute(
                         f"DELETE FROM {table} WHERE id IN "
                         f"(SELECT id FROM {table} WHERE ts < ? LIMIT ?)",
                         (cutoff, batch),
@@ -336,11 +352,11 @@ class Store:
                     total += count
                     if count < batch:
                         break
-                await self._db.commit()
+                await db.commit()
                 deleted[table] = total
             total = 0
             while True:
-                cursor = await self._db.execute(
+                cursor = await db.execute(
                     "DELETE FROM sessions WHERE (client, session_id, endpoint) IN "
                     "(SELECT client, session_id, endpoint FROM sessions "
                     "WHERE last_seen < ? LIMIT ?)",
@@ -350,7 +366,7 @@ class Store:
                 total += count
                 if count < batch:
                     break
-            await self._db.commit()
+            await db.commit()
             deleted["sessions"] = total
         return deleted
 

@@ -64,6 +64,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from starlette.requests import Request
+
 from relay.clients import STATUS_UNREACHABLE_GRACE
 
 __all__ = ["EndpointQueue", "QueueEntry", "Session", "UnknownTracker"]
@@ -107,7 +109,7 @@ class QueueEntry:
     # The Starlette Request, kept so a held request can notice its client
     # hanging up while it waits its turn (method/headers stay readable on
     # it for the whole handler lifetime).
-    request: object
+    request: Request
     enqueued_at: float
     go: asyncio.Event = field(default_factory=asyncio.Event)
     done: bool = False  # True once promoted (left the waiting queue)

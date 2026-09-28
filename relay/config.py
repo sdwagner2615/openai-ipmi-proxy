@@ -150,8 +150,10 @@ def _get_str_opt(section: dict, key: str, where: str) -> str | None:
     if not _present(section, key):
         return None
     value = section[key]
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"field '{key}' in {where} must be a non-empty string when set")
+    if not isinstance(value, str):
+        raise ConfigError(f"field '{key}' in {where} must be a string when set")
+    # Empty is a valid optional value (e.g. an empty password = no auth);
+    # required fields keep the non-empty check in _get_str.
     return value
 
 
@@ -307,9 +309,17 @@ def _build_power(raw: dict, server_type: str, where: str) -> Any:
             verify_ssl=_get_bool(raw, "verify_ssl", where, default=False),
         )
     if server_type == "noop":
-        return NoopPowerConfig(
-            initial_state=_get_enum(raw, "initial_state", where, NOOP_STATES, default="on"),
-        )
+        initial = raw.get("initial_state", "on")
+        # Unquoted `on` / `off` parses as a YAML 1.1 boolean; accept both.
+        if initial is True:
+            initial = "on"
+        elif initial is False:
+            initial = "off"
+        if not isinstance(initial, str) or initial not in NOOP_STATES:
+            raise ConfigError(
+                f"field 'initial_state' in {where} must be 'on' or 'off', got {initial!r}"
+            )
+        return NoopPowerConfig(initial_state=initial)
     if server_type == "aws-ec2":
         access_key = _get_str_opt(raw, "access_key", where)
         secret_key = _get_str_opt(raw, "secret_key", where)
