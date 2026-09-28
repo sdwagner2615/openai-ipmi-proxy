@@ -1,6 +1,15 @@
 .env
+config.yaml
+secrets.env
+*.db
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+coverage.xml
+.coverage
+*.egg-info/
