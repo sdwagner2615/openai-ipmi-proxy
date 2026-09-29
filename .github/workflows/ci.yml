@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --frozen
+      - name: Unit tests
+        if: matrix.python != '3.12'
+        run: uv run pytest -m unit -q
+      - name: Unit tests with coverage
+        if: matrix.python == '3.12'
+        run: uv run pytest -m unit -q --cov=relay --cov-report=xml
+      - name: E2E tests
+        run: uv run pytest -m e2e -q
+        timeout-minutes: 30
+      - name: Upload coverage
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+  container:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: |
+          docker build --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0-ci -t relay-ci .
+      - name: Smoke (boot + /healthz + /monitor/data)
+        run: |
+          set -e
+          cat > /tmp/smoke.yaml <<'EOF'
+          proxy:
+            host: 0.0.0.0
+            port: 8000
+            store:
+              path: /tmp/relay.db
+          servers:
+            - name: local-dev
+              type: noop
+              power:
+                initial_state: on
+              service_url: http://127.0.0.1:8100
+              idle_timeout: 3600
+              shutdown_enabled: false
+          endpoints:
+            - name: default
+              server: local-dev
+              path_prefix: /v1
+              catch_all: true
+              readiness:
+                path: /health
+                interval: 1
+                timeout: 1
+              wait_policy: wait
+              routing: concurrent
+          EOF
+          docker run -d --name relay-smoke -p 8000:8000 \
+            -v /tmp/smoke.yaml:/config/config.yaml:ro \
+            -e RELAY_CONFIG=/config/config.yaml relay-ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8000/healthz
+          echo
+          curl -sf http://127.0.0.1:8000/monitor/data | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'endpoints' in d"
+          echo "monitor data parses"
+          docker logs relay-smoke > /tmp/smoke.log 2>&1 || true
+          docker rm -f relay-smoke > /dev/null
