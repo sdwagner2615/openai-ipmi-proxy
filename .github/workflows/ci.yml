@@ -59,34 +59,8 @@ jobs:
       - name: Smoke (boot + /healthz + /monitor/data)
         run: |
           set -e
-          cat > /tmp/smoke.yaml <<'EOF'
-          proxy:
-            host: 0.0.0.0
-            port: 8000
-            store:
-              path: /tmp/relay.db
-          servers:
-            - name: local-dev
-              type: noop
-              power:
-                initial_state: on
-              service_url: http://127.0.0.1:8100
-              idle_timeout: 3600
-              shutdown_enabled: false
-          endpoints:
-            - name: default
-              server: local-dev
-              path_prefix: /v1
-              catch_all: true
-              readiness:
-                path: /health
-                interval: 1
-                timeout: 1
-              wait_policy: wait
-              routing: concurrent
-          EOF
           docker run -d --name relay-smoke -p 8000:8000 \
-            -v /tmp/smoke.yaml:/config/config.yaml:ro \
+            -v $GITHUB_WORKSPACE/smoke/config.yaml:/config/config.yaml:ro \
             -e RELAY_CONFIG=/config/config.yaml relay-ci
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then

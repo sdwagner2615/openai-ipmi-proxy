@@ -25,8 +25,11 @@ references resolve against the combined `os.environ`.
 proxy:
   host: 0.0.0.0                # bind address
   port: 8000                   # bind port
-  unknown_path_policy: allow   # allow → route to the catch_all endpoint (D17)
-                               # block → 403
+  unknown_path_policy: allow   # allow → route to the catch_all endpoint (D17;
+                                #   passthrough semantics regardless of that
+                                #   endpoint's routing mode)
+                                # block → 403 (a rejected request neither adopts
+                                #   power ownership nor resets the idle timer)
   target_read_timeout: 0       # seconds to wait for the next chunk from a target
                                # (per-chunk for SSE, whole body otherwise); 0 = none
                                # Live-tunable from the monitor (applies to new requests)
@@ -43,8 +46,10 @@ servers:
       host: ${IPMI_HOST}
       user: ${IPMI_USER}
       password: ${IPMI_PASS}
+      # base_url: https://192.168.1.124   # optional full base URL; defaults to
+                                          # https://<host> (use for plain-HTTP BMCs)
       system_path: /redfish/v1/Systems/Self   # default; today's hardcoded
-                                               # discovered_system_path
+                                                # discovered_system_path
       verify_ssl: false        # BMCs use self-signed certs; default false
     service_url: http://192.168.1.186:80      # base URL of the service(s) on it
     idle_timeout: 3600         # seconds: sleep when ALL endpoints idle (D11)
@@ -102,7 +107,9 @@ endpoints:
       expiry: 300              # seconds a session may stay idle before its
                                #   slot is surrendered and it is forgotten
       immediate_idle_release: true   # known clients that truly report idle
-                               #   surrender their slot immediately
+                                #   surrender their slot immediately (the idle
+                                #   report must postdate the last response we
+                                #   served — a stale report waits out `expiry`)
 
   - name: litellm
     server: ec2-gpu
@@ -127,7 +134,8 @@ clients:
       poll_interval: 5         # seconds between status polls per client machine
       status_path: /session/status
       session_path: /session
-      pending_paths: [/permission, /question]
+      pending_paths: [/permission, /question]   # default for kind: opencode;
+                                                # explicit [] disables the poll
     children:
       kind: parent-chain       # child sessions share a tracked ancestor's slot
       depth: 10                # chain walk cap
@@ -145,6 +153,10 @@ clients:
   K/V cache), not the platform.
 - **`clients`** entries are optional; without any, every client is generic
   (IP-identified, busy-window status).
+- **`pending_paths`** — the endpoints that report a session blocked on user
+  input (a pending entry releases the session's spot immediately: the
+  "waiting" state). Defaults to `[/permission, /question]` for
+  `kind: opencode`; an explicit `[]` disables the poll.
 
 ## `.env.sample` (non-secret)
 

@@ -23,6 +23,7 @@ deviating.
 | 6 | [`packaging-ci.md`](packaging-ci.md) | Packaging, tooling (uv/ruff/mypy), tests, CI/CD, Docker |
 | 7 | [`phases.md`](phases.md) | Phase 0–4 task lists with explicit gates |
 | 8 | [`parity.md`](parity.md) | Exhaustive list of current behaviors that must survive the rework |
+| 9 | [`progress.md`](progress.md) | Implementation progress, deviations, open questions |
 
 ## Ground rules
 
