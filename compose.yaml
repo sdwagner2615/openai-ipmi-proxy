@@ -5,4 +5,11 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - RELAY_CONFIG=/config/config.yaml
+    volumes:
+      # Topology + policy (never secrets in git; the live file is gitignored).
+      - ./config.yaml:/config/config.yaml:ro
+      # Secrets live next to the config; the loader reads <config-dir>/secrets.env.
+      - ./secrets.env:/config/secrets.env:ro
     restart: unless-stopped

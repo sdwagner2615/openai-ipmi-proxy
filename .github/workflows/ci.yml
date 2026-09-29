@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: |
-          docker build --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0-ci -t relay-ci .
+          docker build --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+ci -t relay-ci .
       - name: Smoke (boot + /healthz + /monitor/data)
         run: |
           set -e
@@ -96,7 +96,7 @@ jobs:
           done
           curl -sf http://127.0.0.1:8000/healthz
           echo
-          curl -sf http://127.0.0.1:8000/monitor/data | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'endpoints' in d"
+          curl -sf http://127.0.0.1:8000/monitor/data | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'config' in d and 'sessions' in d"
           echo "monitor data parses"
           docker logs relay-smoke > /tmp/smoke.log 2>&1 || true
           docker rm -f relay-smoke > /dev/null
