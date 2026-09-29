@@ -99,6 +99,8 @@ jobs:
           NEW_TAG="v$MAJOR.$MINOR.$PATCH"
           echo "New tag: $NEW_TAG"
           echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          # PEP 440 form (no leading v) for SETUPTOOLS_SCM_PRETEND_VERSION.
+          echo "new_version=$MAJOR.$MINOR.$PATCH" >> $GITHUB_OUTPUT
 
       - name: Generate Changelog
         id: changelog
@@ -129,7 +131,7 @@ jobs:
           context: .
           push: true
           build-args: |
-            SETUPTOOLS_SCM_PRETEND_VERSION=${{ steps.versioning.outputs.new_tag }}
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ steps.versioning.outputs.new_version }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/relay:latest
             ghcr.io/${{ github.repository_owner }}/relay:${{ steps.versioning.outputs.new_tag }}
