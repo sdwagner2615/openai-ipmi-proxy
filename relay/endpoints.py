@@ -265,6 +265,11 @@ class EndpointRuntime:
         for (poller, base), sessions in bases.items():
             if not poller.due(base, now):
                 continue
+            # Stamp the interval at poll start, not completion: stamping after
+            # the fetches makes the gap between polls tick period + sleep
+            # overshoot - fetch duration, which dips below poll_interval and
+            # silently skips every other tick (2s cadence instead of 1s).
+            poller.last_poll[base] = time.monotonic()
             # The status map is per-directory (one opencode "instance" per
             # working directory), so first resolve each session's directory
             # (GET /session/{id}, cached) and then poll one map per
@@ -337,7 +342,6 @@ class EndpointRuntime:
                         session.client_status_detail = (
                             f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
                         )
-            poller.last_poll[base] = time.monotonic()
             # Forget directory cache entries of sessions that are gone.
             live = {s.session_id for s in sessions}
             for key in [k for k in poller.session_dir if k[0] == base and k[1] not in live]:
@@ -356,13 +360,19 @@ class EndpointRuntime:
                 last_check = now
             # The first waiter triggered the initial power-on in the
             # admission path; this keeps the single boot cycle alive
-            # (re-issuing on cooldown) while later requests simply wait.
-            # An ON box is booting (model loading) — just wait (D8).
+            # (re-issuing the power-on on cooldown) while later requests
+            # simply wait. An ON box is booting (model loading) — just wait
+            # (D8).
             if not self.queue.ready and self.server.power_state in (
                 PowerState.OFF,
                 PowerState.UNKNOWN,
             ):
                 await self.server.maybe_power_on()
+            if self.queue.ready:
+                # Ready may have just flipped (probe above or readiness
+                # loop): entries already in the queue are only promoted by
+                # _try_promote, and nothing else re-runs it for them.
+                self.queue._try_promote()
 
         # 4) Prune passthrough/catch-all activity (the catch-all endpoint
         # owns the shared tracker).
@@ -403,6 +413,16 @@ class EndpointRuntime:
                 return "timed_out"
             await asyncio.sleep(1.0)
 
+    async def admit_catch_all(self, request: Request, full_path: str) -> Response:
+        """Catch-all traffic (D17): passthrough semantics, no queueing and no
+        session tracking, regardless of the endpoint's routing mode."""
+        try:
+            body = await request.body()
+        except Exception as e:
+            logger.error("Failed to read request body: %s", e)
+            return JSONResponse(status_code=400, content={"error": "Failed to read request body."})
+        return await self.admit_unqueued(request, full_path, body)
+
     async def admit(self, request: Request, full_path: str) -> Response:
         """Admits one routed request (architecture.md request flow, steps 2-6)."""
         try:
@@ -411,35 +431,28 @@ class EndpointRuntime:
             logger.error("Failed to read request body: %s", e)
             return JSONResponse(status_code=400, content={"error": "Failed to read request body."})
 
-        # Readiness gate (D8): a fresh probe on an empty queue (P3 — the
-        # manager's bookkeeping may be stale), then the wait policy.
-        if not self.queue.ready:
-            if not self.queue.queue:
-                await self.check_readiness()
-            if not self.queue.ready:
-                if self.config.wait_policy == "error":
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "error": {
-                                "message": (
-                                    f"Service for endpoint '{self.name}' is not ready; retry later."
-                                ),
-                                "type": "server_error",
-                                "param": None,
-                                "code": "service_not_ready",
-                            }
-                        },
-                    )
-                result = await self.wait_until_ready(request, self.config.queue_timeout or None)
-                if result != "ok":
-                    return self._hold_rejected(result, full_path)
-
-        routing = self.config.routing
-        if routing == "queued":
+        if self.config.routing == "queued":
             return await self._admit_queued(request, full_path, body)
+        return await self.admit_unqueued(request, full_path, body)
 
-        # concurrent / passthrough: forward as received (D16).
+    async def admit_unqueued(self, request: Request, full_path: str, body: bytes) -> Response:
+        """Forwards without queueing or session tracking (D16, D17).
+
+        Used for ``concurrent``/``passthrough`` routing and for catch-all
+        traffic (unmatched paths routed to the catch_all endpoint with
+        passthrough semantics). Readiness gate (D8) first; the held request
+        is not in the queue, so it is counted separately for idle-off
+        accounting.
+        """
+        if not self.queue.queue:
+            await self.check_readiness()
+        if not self.queue.ready:
+            if self.config.wait_policy == "error":
+                return self._not_ready()
+            result = await self.wait_until_ready(request, self.config.queue_timeout or None)
+            if result != "ok":
+                return self._hold_rejected(result, full_path)
+
         self.active_forwards += 1
 
         def _finish(code: int | None) -> None:
@@ -448,6 +461,20 @@ class EndpointRuntime:
         return await self._forward(request, full_path, body, _finish)
 
     async def _admit_queued(self, request: Request, full_path: str, body: bytes) -> Response:
+        # Readiness gate (D8): a fresh probe on an empty queue, always (P3 —
+        # the manager's bookkeeping may be stale in BOTH directions: the
+        # target may have just died while `ready` is still True), then the
+        # wait policy. Under the wait policy the request joins the queue
+        # while it waits, so it stays visible to the monitor and the manager
+        # keeps the boot cycle alive (re-issuing the power-on on cooldown)
+        # until it is served.
+        if not self.queue.queue:
+            await self.check_readiness()
+        if not self.queue.ready:
+            if self.config.wait_policy == "error":
+                return self._not_ready()
+            await self._ensure_wake()
+
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
         client_name, session_id = resolve_session_id(
@@ -498,6 +525,19 @@ class EndpointRuntime:
             full_path,
             body,
             lambda code: self.queue.release(entry, code),
+        )
+
+    def _not_ready(self) -> Response:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"Service for endpoint '{self.name}' is not ready; retry later.",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "service_not_ready",
+                }
+            },
         )
 
     def _hold_rejected(self, result: str, full_path: str) -> Response:

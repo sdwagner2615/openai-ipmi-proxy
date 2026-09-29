@@ -224,7 +224,8 @@ class StatusPoller:
         GETs the status map for one client base and directory. Returns a
         dict of session-id -> status-object, or None when the client is
         unreachable or answers with garbage (callers keep last-known state
-        in that case). The caller records last_poll[base] after the call.
+        in that case). The caller stamps last_poll[base] at poll start
+        (before the fetches) so the interval is measured start-to-start.
         """
         url = base + self.provider.status_path
         params = {"directory": directory} if directory else None

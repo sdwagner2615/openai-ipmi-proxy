@@ -317,6 +317,10 @@ def create_app(config_path: str | Path) -> FastAPI:
                 full_path,
                 f"{endpoint.server.config.service_url}{full_path}",
             )
+            # D17: unmatched paths use passthrough semantics (no queue, no
+            # session), whatever the catch_all endpoint's routing mode is.
+            await endpoint.server.on_routed_traffic()
+            return await endpoint.admit_catch_all(request, full_path)
         await endpoint.server.on_routed_traffic()
         return await endpoint.admit(request, full_path)
 

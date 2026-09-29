@@ -350,9 +350,15 @@ class EndpointQueue:
                 self.immediate_idle_release
                 and session.client_status == "idle"
                 and self._fresh_client_report(session, now)
+                and session.client_status_at > session.last_request_at
             ):
                 # The client truly told us it is idle (fresh report, not the
-                # unreachable-grace fallback): no cooldown, release now.
+                # unreachable-grace fallback) AFTER we served its last
+                # request: no cooldown, release now. A report older than the
+                # last response is stale - it was recorded while we were
+                # still serving that request, and must not release the spot
+                # the moment the response lands (deviation D-immediate-stale,
+                # recorded in docs/relay/progress.md).
                 return session.idle_since
             return session.idle_since + self.session_expiry
         # Unknown clients: busy window and expiry are both measured from

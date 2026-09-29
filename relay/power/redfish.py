@@ -23,19 +23,25 @@ DEFAULT_SYSTEM_PATH = "/redfish/v1/Systems/Self"
 class RedfishBackend(IpmiBackend):
     """Power backend for `type: redfish` servers (MegaRAC-style BMCs)."""
 
-    def __init__(self, config: RedfishPowerConfig, *, http_client: httpx.AsyncClient | None = None):
-        # Most BMCs use self-signed certs on HTTPS; verify_ssl is a
-        # per-server config (default false, kept from the old behavior).
-        base_url = config.base_url or f"https://{config.host}"
-        super().__init__(
-            BmcClient(
+    def __init__(
+        self,
+        config: RedfishPowerConfig,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+        bmc: BmcClient | None = None,
+    ):
+        if bmc is None:
+            # Most BMCs use self-signed certs on HTTPS; verify_ssl is a
+            # per-server config (default false, kept from the old behavior).
+            base_url = config.base_url or f"https://{config.host}"
+            bmc = BmcClient(
                 base_url=base_url,
                 user=config.user,
                 password=config.password,
                 verify_ssl=config.verify_ssl,
                 http_client=http_client,
             )
-        )
+        super().__init__(bmc)
         self._system_path = config.system_path
 
     async def _read_power_state(self) -> PowerState:

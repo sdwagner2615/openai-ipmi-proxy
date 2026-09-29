@@ -463,14 +463,21 @@ def _build_match(raw: dict, where: str) -> MatchConfig:
 
 
 def _build_status(raw: dict, where: str) -> StatusConfig:
+    kind = _get_enum(raw, "kind", where, STATUS_KINDS, default="opencode")
+    if _present(raw, "pending_paths"):
+        pending_paths = _get_str_list(raw, "pending_paths", where)
+    else:
+        # opencode's standard pending-input endpoints (parity: the legacy
+        # client had them hardcoded); an explicit [] disables the poll.
+        pending_paths = ["/permission", "/question"] if kind == "opencode" else []
     return StatusConfig(
-        kind=_get_enum(raw, "kind", where, STATUS_KINDS, default="opencode"),
+        kind=kind,
         port=_get_int(raw, "port", where, default=4096, minimum=1),
         password=_get_str_opt(raw, "password", where) or "",
         poll_interval=_get_float(raw, "poll_interval", where, default=5, minimum=0.1),
         status_path=_get_str_opt(raw, "status_path", where) or "/session/status",
         session_path=_get_str_opt(raw, "session_path", where) or "/session",
-        pending_paths=_get_str_list(raw, "pending_paths", where),
+        pending_paths=pending_paths,
     )
 
 

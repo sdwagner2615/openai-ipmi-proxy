@@ -126,6 +126,8 @@ clients:
       # status_path: /session/status
       # session_path: /session
       # pending_paths: [/permission, /question]
+      #   Blocked-on-user-input endpoints (kind opencode default); set [] to
+      #   disable the pending poll.
     children:
       kind: parent-chain       # child sessions share a tracked ancestor's slot
       depth: 10                # chain walk cap
