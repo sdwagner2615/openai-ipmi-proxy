@@ -2,7 +2,8 @@
 
 Three inputs, one rule (D4): `config.yaml` owns topology + policy,
 `.env` owns non-secret operational values, `secrets.env` owns secrets,
-referenced from config via `${VAR}`.
+referenced from config via `${VAR}` or `${VAR:-default}` (the default is
+used when the variable is unset or empty, like bash `:-`).
 
 Load order: `.env` then `secrets.env` are searched in the working
 directory and next to the config file (secrets win on key overlap, and the
@@ -39,7 +40,7 @@ from relay.models import (
 
 __all__ = ["ConfigError", "load_config"]
 
-_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}")
 
 UNKNOWN_PATH_POLICIES = ("allow", "block")
 WAIT_POLICIES = ("wait", "error")
@@ -91,7 +92,7 @@ def _load_env_files(config_dir: Path) -> None:
 
 
 def _interpolate(node: Any, key_path: str) -> Any:
-    """Recursively resolves ${VAR} references in string values."""
+    """Recursively resolves ${VAR} and ${VAR:-default} references in strings."""
     if isinstance(node, dict):
         return {key: _interpolate(value, f"{key_path}.{key}") for key, value in node.items()}
     if isinstance(node, list):
@@ -100,7 +101,10 @@ def _interpolate(node: Any, key_path: str) -> Any:
 
         def _sub(match: re.Match[str]) -> str:
             name = match.group(1)
+            default = match.group(3)  # None for a plain ${VAR}
             value = os.environ.get(name)
+            if (value is None or value == "") and default is not None:
+                return default  # bash `:-` semantics: empty counts as unset
             if value is None:
                 raise ConfigError(
                     f"environment variable '{name}' referenced at '{key_path}' is not set "
@@ -108,7 +112,15 @@ def _interpolate(node: Any, key_path: str) -> Any:
                 )
             return value
 
-        return _ENV_VAR_RE.sub(_sub, node)
+        result = _ENV_VAR_RE.sub(_sub, node)
+        if "${" in result:
+            # Unmatched ${...} (e.g. a typo or an unsupported form) must never
+            # reach the runtime as a literal string.
+            raise ConfigError(
+                f"unsupported environment reference at '{key_path}': {result!r} "
+                "(supported forms: ${VAR} and ${VAR:-default})"
+            )
+        return result
     return node
 
 

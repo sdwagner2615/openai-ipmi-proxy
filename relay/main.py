@@ -343,12 +343,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
     try:
         config = load_config(args.config)
     except ConfigError as e:
         raise SystemExit(f"relay: config error: {e}") from e
+    # After load_config: .env / secrets.env values are in os.environ.
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     app = create_app(args.config)
     uvicorn.run(app, host=args.host or config.proxy.host, port=args.port or config.proxy.port)

@@ -1,12 +1,52 @@
-"""SQLite store: schema, reconciliation, retention, in-memory safety (D5)."""
+"""SQLite store: migrations, reconciliation, retention, in-memory safety (D5)."""
 
 import time
 
+import aiosqlite
 import pytest
 
 from relay.store import Store
 
 pytestmark = pytest.mark.unit
+
+
+async def test_open_applies_migrations_to_fresh_db(tmp_path):
+    db_path = str(tmp_path / "relay.db")
+    store = Store(db_path)
+    await store.open()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row[0] for row in await cursor.fetchall()}
+        assert {
+            "server_runtime",
+            "endpoint_runtime",
+            "power_events",
+            "requests",
+            "sessions",
+            "alembic_version",
+        } <= tables
+        cursor = await db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        indexes = {row[0] for row in await cursor.fetchall()}
+        assert {
+            "idx_requests_ts",
+            "idx_requests_endpoint",
+            "idx_power_events_server",
+        } <= indexes
+    await store.close()
+
+
+async def test_reopen_is_idempotent(tmp_path):
+    db_path = str(tmp_path / "relay.db")
+    store = Store(db_path)
+    await store.open()
+    await store.reconcile_servers(["ws"])
+    await store.close()
+    # A second boot migrates nothing and restores state.
+    store2 = Store(db_path)
+    await store2.open()
+    rows = await store2.reconcile_servers(["ws"])
+    assert rows["ws"].owned is False
+    await store2.close()
 
 
 async def test_open_creates_schema_and_round_trips(tmp_path):
@@ -79,41 +119,45 @@ async def test_power_events_logged_and_ordered(tmp_path):
 
 
 async def test_prune_respects_retention(tmp_path):
-    store = Store(str(tmp_path / "relay.db"))
+    db_path = str(tmp_path / "relay.db")
+    store = Store(db_path)
     await store.open()
     await store.reconcile_servers(["ws"])
     now = time.time()
-    db = store.db
-    await db.execute(
-        "INSERT INTO requests (ts, server, endpoint, client, session_id, "
-        "wait_seconds, active_seconds, status_code, request_bytes, response_bytes) "
-        "VALUES (?, 'ws', 'llm', 'c', 's', 0, 0, 200, 1, 1)",
-        (now - 100 * 86400,),  # 100 days old
-    )
-    await db.execute(
-        "INSERT INTO requests (ts, server, endpoint, client, session_id, "
-        "wait_seconds, active_seconds, status_code, request_bytes, response_bytes) "
-        "VALUES (?, 'ws', 'llm', 'c', 's', 0, 0, 200, 1, 1)",
-        (now - 1.0,),  # fresh
-    )
-    await db.execute(
-        "INSERT INTO power_events (ts, server, action, reason, initiated_by, success) "
-        "VALUES (?, 'ws', 'state_sync', 'poll', 'proxy', 1)",
-        (now - 100 * 86400,),
-    )
-    await db.execute(
-        "INSERT INTO sessions (client, session_id, endpoint, first_seen, last_seen, request_count) "
-        "VALUES ('c', 's', 'llm', ?, ?, 1)",
-        (now - 100 * 86400, now - 100 * 86400),
-    )
-    await db.commit()
+    # Seed history rows through a second connection (WAL allows it).
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO requests (ts, server, endpoint, client, session_id, "
+            "wait_seconds, active_seconds, status_code, request_bytes, response_bytes) "
+            "VALUES (?, 'ws', 'llm', 'c', 's', 0, 0, 200, 1, 1)",
+            (now - 100 * 86400,),  # 100 days old
+        )
+        await db.execute(
+            "INSERT INTO requests (ts, server, endpoint, client, session_id, "
+            "wait_seconds, active_seconds, status_code, request_bytes, response_bytes) "
+            "VALUES (?, 'ws', 'llm', 'c', 's', 0, 0, 200, 1, 1)",
+            (now - 1.0,),  # fresh
+        )
+        await db.execute(
+            "INSERT INTO power_events (ts, server, action, reason, initiated_by, success) "
+            "VALUES (?, 'ws', 'state_sync', 'poll', 'proxy', 1)",
+            (now - 100 * 86400,),
+        )
+        await db.execute(
+            "INSERT INTO sessions "
+            "(client, session_id, endpoint, first_seen, last_seen, request_count) "
+            "VALUES ('c', 's', 'llm', ?, ?, 1)",
+            (now - 100 * 86400, now - 100 * 86400),
+        )
+        await db.commit()
     deleted = await store.prune(retention_days=90)
     assert deleted["requests"] == 1
     assert deleted["power_events"] == 1
     assert deleted["sessions"] == 1
-    cursor = await store.db.execute("SELECT COUNT(*) AS n FROM requests")
-    row = await cursor.fetchone()
-    assert row[0] == 1  # only the fresh row survives
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT COUNT(*) AS n FROM requests")
+        row = await cursor.fetchone()
+        assert row[0] == 1  # only the fresh row survives
     await store.close()
 
 

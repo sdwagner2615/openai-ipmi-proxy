@@ -55,6 +55,15 @@ Every locked decision, made with the maintainer. Implement exactly these.
 | D27 | **CI:** new `ci.yml` (lint → test matrix → container smoke on every PR + push to main); existing `publish.yml` **gated on lint + test**, image renamed to `relay`, version via setuptools-scm build-arg. Conventional commits stay (semver + changelog depend on them). |
 | D28 | **Packaging:** `relay` package with `relay` console entry point (`relay --config …`); `create_app(config_path)` factory for embedding; version is dynamic via **setuptools-scm** (git tag = single source of truth); new `GET /healthz` self-health endpoint for the container `HEALTHCHECK`; non-root Docker image; `config.yaml` + `secrets.env` mounted in compose. |
 
+## Configuration & storage amendments
+
+| # | Decision |
+|---|----------|
+| D29 | **Env substitution supports `${VAR:-default}`** (bash `:-` semantics: unset *or empty* → default). A plain `${VAR}` that is unset stays a startup error, and **any other `${...}` form is a startup error** (fail loud, no silent pass-through of the literal string). This is what makes optional secrets (e.g. `OPENCODE_SERVER_PASSWORD`) and `RELAY_DB_PATH` safely omittable. |
+| D30 | **One mechanism for the config path:** the `RELAY_CONFIG` env var (image `ENV` default `/config/config.yaml`, overridable with `docker run -e`); the Dockerfile no longer bakes `--config` into the `CMD`. Precedence: `--config` flag > process env `RELAY_CONFIG` > image default > `./config.yaml`. `.env` ships no `RELAY_CONFIG`/`RELAY_DB_PATH` — compose injects `.env` into the container, where the image defaults must stay in charge. |
+| D31 | **Store = SQLAlchemy 2.0 (async, `aiosqlite` driver) + Alembic.** The models in `relay/db.py` are the schema source of truth; migrations in `relay/migrations` are generated from them and applied automatically on store open (extends D5: still SQLite, still WAL, still a single async writer). `:memory:` (tests) is built straight from the metadata. Legacy pre-Alembic DBs are not auto-upgraded (delete on upgrade). |
+| D32 | **Default DB location in the container: `/data/relay.db`** (image `ENV RELAY_DB_PATH`; `/data` created and owned by the non-root user; compose bind-mounts `./data:/data`). Absence of env vars ⇒ the container boots at its defaults instead of failing. |
+
 ## Parking lot (deferred — Phase 4 or later, do not build now)
 
 - Admin login / token auth on `/monitor` + power routes.

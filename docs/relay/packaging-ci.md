@@ -22,6 +22,8 @@ dependencies = [
   "python-dotenv>=1.0",
   "pyyaml>=6.0",
   "aiosqlite>=0.20",
+  "sqlalchemy[asyncio]>=2.0",  # store (D31)
+  "alembic>=1.13",             # store migrations (D31)
   "croniter>=2.0",
   "websockets>=12",
 ]
@@ -30,7 +32,7 @@ dependencies = [
 aws = ["boto3>=1.34"]            # relay[aws] — EC2 backend (D10)
 
 [project.scripts]
-relay = "relay.main:main"        # relay --config /config/config.yaml
+relay = "relay.main:main"        # relay (config: --config | $RELAY_CONFIG | ./config.yaml)
 
 [dependency-groups]
 dev = [
@@ -105,7 +107,7 @@ tests/
     test_scheduler.py    # cron evaluation, deferral while active
     test_ownership.py    # D12: adopt, release on off, restore on restart,
                          #   never-off-unowned (the operator's manual-on scenario)
-    test_store.py        # schema, reconciliation, retention, in-memory safety
+    test_store.py        # migrations on open, reconciliation, retention, in-memory safety
     test_power_redfish.py  # state mapping + action payloads via httpx.MockTransport
     test_power_ec2.py      # state map + start/stop/terminate via fake client
   e2e/
@@ -205,31 +207,35 @@ COPY relay ./relay
 RUN uv pip install --system --no-cache . && \
     uv pip install --system --no-cache '.[aws]'
 
-# non-root (D28)
-RUN useradd -m relay
+# non-root (D28); /data is the default home of the SQLite DB (writable).
+RUN useradd -m relay && mkdir -p /data && chown relay:relay /data
 USER relay
 
+# Image defaults for the config path and DB location; override with -e at run
+# time (the entrypoint falls back to $RELAY_CONFIG, then ./config.yaml).
 ENV RELAY_CONFIG=/config/config.yaml
+ENV RELAY_DB_PATH=/data/relay.db
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.0:8000/healthz', timeout=3)"
+  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
 
 ENTRYPOINT ["relay"]
-CMD ["--config", "/config/config.yaml"]
 ```
 
+- No `--config` in the `CMD` (D30): the entrypoint falls back to
+  `$RELAY_CONFIG`, so `docker run -e RELAY_CONFIG=…` works.
 - Build-arg `SETUPTOOLS_SCM_PRETEND_VERSION` is consumed via
   `ARG SETUPTOOLS_SCM_PRETEND_VERSION` + `ENV` in the install step (or pass
   through `docker/build-push-action` `build-args`).
 - `.dockerignore`: `.git`, `.venv`, `venv`, `__pycache__`, `tests`, `docs`,
-  `*.db`, `.env`, `secrets.env`, `config.yaml`, `.github`, `scripts`,
+  `*.db`, `data`, `.env`, `secrets.env`, `config.yaml`, `.github`, `scripts`,
   `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `coverage.xml`.
 - `compose.yaml`: mount `./config.yaml:/config/config.yaml:ro` and
-  `./secrets.env:/config/secrets.env:ro`, keep port map + restart policy,
-  add the `RELAY_CONFIG` env. (The app loads `.env`/`secrets.env` from its
-  working dir **or** next to the config file — implement
-  "also load `<config-dir>/secrets.env`" in `config.py` so the mounted file
-  is picked up inside the container.)
+  `./secrets.env:/config/secrets.env:ro`, plus `./data:/data` (writable DB
+  home, D32); keep port map + restart policy. (The app loads
+  `.env`/`secrets.env` from its working dir **or** next to the config file —
+  `config.py` loads `<config-dir>/secrets.env` so the mounted file is
+  picked up inside the container.)
 - The image includes the `aws` extra by default (D10).
 
 ## Release process (unchanged except gating + rename)

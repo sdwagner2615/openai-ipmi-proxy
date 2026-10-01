@@ -55,7 +55,8 @@ docker compose up -d
 ```
 
 The proxy listens on `:8000`; `config.yaml` and `secrets.env` are mounted
-read-only at `/config/`.
+read-only at `/config/`; the SQLite DB persists in `./data/` (in the image
+it defaults to `/data/relay.db` — no env vars required to boot).
 
 ## Running from source
 

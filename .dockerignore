@@ -7,6 +7,7 @@ tests
 docs
 scripts
 *.db
+data
 .env
 secrets.env
 config.yaml

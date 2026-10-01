@@ -3,7 +3,10 @@
 Three inputs, one rule (D4): **`config.yaml` owns topology + policy**
 (gitignored, shipped as `config.yaml.sample`), **`.env` owns non-secret
 operational values** (from `.env.sample`), **`secrets.env` owns secrets**
-(from `secrets.env.sample`) referenced from config via `${VAR}`.
+(from `secrets.env.sample`) referenced from config via `${VAR}` or
+`${VAR:-default}` (bash `:-` semantics: the default is used when the
+variable is unset or empty — this is what makes optional secrets and
+`RELAY_DB_PATH` safely omittable).
 
 ```bash
 cp config.yaml.sample config.yaml
@@ -11,9 +14,21 @@ cp .env.sample .env
 cp secrets.env.sample secrets.env
 ```
 
-Load order (in `config.py`): `load_dotenv(".env")` then
-`load_dotenv("secrets.env")` — secrets win on any key overlap. `${VAR}`
-references resolve against the combined `os.environ`.
+Load order (in `config.py`): `.env` then `secrets.env` are read from the
+working directory **and** from the config file's directory — secrets win on
+key overlap, and the copy next to the config file wins over the CWD copy.
+Values never clobber the process environment. `${VAR}` / `${VAR:-default}`
+references resolve against the merged `os.environ`; any other `${...}` form
+is a startup error (no silent pass-through).
+
+## Config path resolution
+
+`--config` flag > process env `RELAY_CONFIG` > image default
+`/config/config.yaml` (Docker) > `./config.yaml`. The Docker image sets
+`RELAY_CONFIG` with `ENV` and does **not** bake `--config` into the `CMD`,
+so `docker run -e RELAY_CONFIG=…` works. `.env` deliberately carries no
+`RELAY_CONFIG`/`RELAY_DB_PATH`: compose injects `.env` into the container
+(`env_file`), where the image defaults must stay in charge.
 
 ## `config.yaml` — full reference
 
@@ -36,7 +51,8 @@ proxy:
   session_id_headers:          # generic fallback session headers (D22 step 2),
     - x-session-id             #   comma-insensitive list, checked in order
   store:
-    path: ${RELAY_DB_PATH}     # SQLite file (default ./relay.db)
+    path: ${RELAY_DB_PATH:-./relay.db}   # SQLite file (default ./relay.db;
+                                         # /data/relay.db in the container)
     retention_days: 90         # prune requests/sessions/power_events older than this
 
 servers:
@@ -130,7 +146,7 @@ clients:
     status:
       kind: opencode           # status-source plugin: opencode | none
       port: 4096               # probed on the client's SOURCE IP
-      password: ${OPENCODE_SERVER_PASSWORD}   # optional basic auth (user "opencode")
+      password: ${OPENCODE_SERVER_PASSWORD:-}   # optional basic auth (user "opencode")
       poll_interval: 5         # seconds between status polls per client machine
       status_path: /session/status
       session_path: /session
@@ -162,8 +178,13 @@ clients:
 
 ```bash
 # relay operational settings (non-secret).  cp .env.sample .env
-RELAY_CONFIG=./config.yaml
-RELAY_DB_PATH=./relay.db
+#
+# Values here are loaded into the environment before config.yaml is read
+# (process environment always wins). Secrets live in secrets.env.
+#
+# Keep deployment paths out of this file: compose injects it into the
+# container (env_file), where the image defaults rule instead —
+# RELAY_CONFIG=/config/config.yaml, RELAY_DB_PATH=/data/relay.db.
 LOG_LEVEL=INFO
 # BMC address (an address, not a secret); credentials live in secrets.env
 IPMI_HOST=192.168.1.124
@@ -193,7 +214,9 @@ OPENCODE_SERVER_PASSWORD=
    `kind` values within their enums.
 7. `schedule`, when set, must parse as a 5-field cron expression.
 8. Every `${VAR}` must resolve (missing var ⇒ startup error naming the var
-   and the config key that used it).
+   and the config key that used it) — unless written `${VAR:-default}`,
+   where an unset/empty var yields the default. Any other `${...}` form is
+   a startup error.
 9. Per-type power blocks must carry their required fields
    (redfish: host/user/password; aws-ec2: region/instance_id and either
    keys or profile; noop: nothing).

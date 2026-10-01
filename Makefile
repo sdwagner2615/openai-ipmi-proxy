@@ -44,20 +44,23 @@ coverage: ## Unit coverage report
 run: ## Run the proxy (CONFIG ?= ./config.yaml)
 	$(UV) run relay --config $(CONFIG)
 
+migrate: ## Apply pending Alembic migrations to the local ./relay.db
+	$(UV) run alembic upgrade head
+
 build: ## Build the Docker image
 	docker build --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+local -t $(IMAGE) .
 
-smoke: build ## Build, boot the image with a noop config, check /healthz + /monitor/data
+smoke: build ## Build, boot the image with a noop config, check /healthz + /monitor/data + default DB
 	docker rm -f relay-smoke 2>/dev/null || true
 	docker run -d --name relay-smoke -p 8000:8000 \
-	  -v ./smoke/config.yaml:/config/config.yaml:ro \
-	  -e RELAY_CONFIG=/config/config.yaml $(IMAGE)
+	  -v ./smoke/config.yaml:/config/config.yaml:ro $(IMAGE)
 	for i in $$(seq 1 30); do \
 	  curl -sf http://127.0.0.1:8000/healthz > /dev/null && break; \
 	  sleep 1; \
 	done
 	curl -sf http://127.0.0.1:8000/healthz && echo
 	curl -sf http://127.0.0.1:8000/monitor/data | $(UV) run python -c "import json,sys; d=json.load(sys.stdin); assert 'config' in d and 'sessions' in d" && echo "monitor data parses"
+	docker exec relay-smoke test -f /data/relay.db && echo "db created at default location"
 	docker rm -f relay-smoke > /dev/null
 
 ## Housekeeping ------------------------------------------------------------------

@@ -188,9 +188,11 @@ relay/
   __init__.py              # __version__
   __main__.py              # python -m relay
   main.py                  # create_app(config_path) + run() console entry
-  config.py                # YAML load, ${ENV} interpolation, validation
+  config.py                # YAML load, ${ENV} / ${ENV:-default} interpolation, validation
   models.py                # config dataclasses + runtime state dataclasses
-  store.py                 # SQLite (aiosqlite): schema, reconciliation, retention
+  db.py                    # SQLAlchemy models + engine (schema source of truth, D31)
+  store.py                 # SQLite store (SQLAlchemy async): reconciliation, retention
+  migrations/              # Alembic env + versions (applied on store open, D31)
   servers.py               # ServerRuntime + power sync loop + shutdown engine
   endpoints.py             # EndpointRuntime + routing table + readiness polling
   queue.py                 # generic slot queue (from session_queue.py)

@@ -18,7 +18,8 @@ proxy:
   session_id_headers:          # generic fallback session headers (D22 step 2),
     - x-session-id             # checked in order
   store:
-    path: ${RELAY_DB_PATH}     # SQLite file (default ./relay.db)
+    path: ${RELAY_DB_PATH:-./relay.db}   # SQLite file (default ./relay.db;
+                                         # /data/relay.db in the container)
     retention_days: 90         # prune requests/sessions/power_events older than this
 
 servers:
@@ -120,8 +121,8 @@ clients:
     status:
       kind: opencode           # status-source plugin: opencode | none
       port: 4096               # probed on the client's SOURCE IP
-      password: ${OPENCODE_SERVER_PASSWORD}   # optional basic auth (user
-                                              # "opencode"); empty = no auth
+      password: ${OPENCODE_SERVER_PASSWORD:-}   # optional basic auth (user
+                                                # "opencode"); unset/empty = none
       poll_interval: 5         # seconds between status polls per client machine
       # status_path: /session/status
       # session_path: /session

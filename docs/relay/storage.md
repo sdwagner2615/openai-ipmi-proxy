@@ -4,75 +4,42 @@ Rule (D5): **config owns *what exists and the policy*; SQLite owns *what is
 happening and what has happened*.** The app never reads policy from the DB
 and never writes policy to the DB.
 
-Library: `aiosqlite`, **WAL mode** (concurrent readers during writes), single
-async writer (the app's asyncio loop). File: `proxy.store.path`.
+Library: SQLAlchemy 2.0 (async, `aiosqlite` driver), **WAL mode**
+(concurrent readers during writes), single async writer (all writes are
+serialized on a store lock). File: `proxy.store.path` (container default:
+`/data/relay.db`).
 
 ## Schema
 
-```sql
--- One row per server: current runtime state, reconciled with config at startup.
-CREATE TABLE IF NOT EXISTS server_runtime (
-    name              TEXT PRIMARY KEY,
-    power_state       TEXT,              -- on | off | unknown  (coarse; transient
-                                         --   powering_on/off lives in memory)
-    owned             INTEGER NOT NULL,  -- 1 = proxy owns the power lifecycle (D12)
-    shutdown_override INTEGER,           -- NULL = use config default; else 0/1 for
-                                         --   the current power cycle (monitor toggle)
-    cycle_id          TEXT,              -- uuid per proxy-initiated power-on
-    updated_at        REAL               -- monotonic-ish epoch (time.time() fine here)
-);
+The SQLAlchemy models in `relay/db.py` are the single source of truth —
+five tables:
 
--- One row per endpoint: latest readiness bookkeeping.
-CREATE TABLE IF NOT EXISTS endpoint_runtime (
-    name          TEXT PRIMARY KEY,
-    ready         INTEGER,               -- 0/1
-    ready_since   REAL,                  -- when it last transitioned to ready
-    last_check_at REAL
-);
+- `server_runtime` — one row per server: coarse power state
+  (`on | off | unknown`; transient powering_on/off lives in memory),
+  `owned` (D12), `shutdown_override` (NULL = config default; else the
+  per-cycle monitor toggle), `cycle_id` (uuid per proxy-initiated power-on),
+  `updated_at`.
+- `endpoint_runtime` — one row per endpoint: `ready`, `ready_since`,
+  `last_check_at`.
+- `power_events` — append-only audit of every power action (success AND
+  failure); feeds metrics + future cost. Index `(server, ts)`.
+- `requests` — append-only activity log: metrics + future cost basis
+  (D13: never gates shutdowns). Indexes `(ts)`, `(endpoint, ts)`.
+- `sessions` — history per `(client, session_id, endpoint)` composite key.
 
--- Append-only audit of every power action. Feeds metrics + future cost.
-CREATE TABLE IF NOT EXISTS power_events (
-    id           INTEGER PRIMARY KEY,
-    ts           REAL,
-    server       TEXT,
-    action       TEXT,    -- power_on | power_off | schedule_off | idle_off
-                    -- | state_sync | external_change
-    reason       TEXT,    -- request_wake | idle_timeout | schedule | manual
-                    -- | adopted | startup_sync | ...
-    initiated_by TEXT,    -- proxy | monitor-ui | startup
-    success      INTEGER
-);
+### Migrations (Alembic, D31)
 
--- Append-only activity log: metrics + future cost basis (D13: never gates shutdowns).
-CREATE TABLE IF NOT EXISTS requests (
-    id             INTEGER PRIMARY KEY,
-    ts             REAL,
-    server         TEXT,
-    endpoint       TEXT,
-    client         TEXT,        -- white-glove client name, or "ip:<ip> (<ua>)"
-    session_id     TEXT,
-    wait_seconds   REAL,        -- time held in the queue before promotion
-    active_seconds REAL,        -- time in flight (forward start → response done)
-    status_code    INTEGER,
-    request_bytes  INTEGER,
-    response_bytes INTEGER
-);
-
--- History per (client, session_id, endpoint).
-CREATE TABLE IF NOT EXISTS sessions (
-    client        TEXT,
-    session_id    TEXT,
-    endpoint      TEXT,
-    first_seen    REAL,
-    last_seen     REAL,
-    request_count INTEGER,
-    PRIMARY KEY (client, session_id, endpoint)
-);
-
-CREATE INDEX IF NOT EXISTS idx_requests_ts          ON requests(ts);
-CREATE INDEX IF NOT EXISTS idx_requests_endpoint    ON requests(endpoint, ts);
-CREATE INDEX IF NOT EXISTS idx_power_events_server  ON power_events(server, ts);
-```
+- Migrations live in `relay/migrations/versions/` (shipped in the wheel and
+  the Docker image). They are generated from `Base.metadata` —
+  `uv run alembic revision --autogenerate -m "..."` (dev `alembic.ini` at
+  the repo root) — and applied **automatically on store open**: a fresh
+  path is created at head, an existing file is upgraded in place (the
+  `alembic_version` table tracks the applied head).
+- Cutover note: DBs created by the pre-Alembic store have no
+  `alembic_version` row and are **not** auto-upgraded — delete the old
+  `.db` when upgrading (runtime state only; history is lost).
+- A schema change = a new migration + a unit test; never edit an applied
+  migration.
 
 ## Per-table contract
 
@@ -124,6 +91,7 @@ At boot, after loading config:
 ## Test hooks
 
 - `store.py` must accept an in-memory (`":memory:"`) or temp-file path —
-  unit tests use temp files (WAL + multiple connections), never the real
+  unit tests use temp files (WAL + multiple connections) or `:memory:`
+  (schema built straight from the metadata, no Alembic), never the real
   `relay.db`.
 - Expose a `Store.close()` used by the app lifespan and test fixtures.

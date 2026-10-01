@@ -56,12 +56,11 @@ jobs:
       - name: Build image
         run: |
           docker build --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+ci -t relay-ci .
-      - name: Smoke (boot + /healthz + /monitor/data)
+      - name: Smoke (boot + /healthz + /monitor/data + default DB)
         run: |
           set -e
           docker run -d --name relay-smoke -p 8000:8000 \
-            -v $GITHUB_WORKSPACE/smoke/config.yaml:/config/config.yaml:ro \
-            -e RELAY_CONFIG=/config/config.yaml relay-ci
+            -v $GITHUB_WORKSPACE/smoke/config.yaml:/config/config.yaml:ro relay-ci
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then
               break
@@ -72,5 +71,7 @@ jobs:
           echo
           curl -sf http://127.0.0.1:8000/monitor/data | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'config' in d and 'sessions' in d"
           echo "monitor data parses"
+          docker exec relay-smoke test -f /data/relay.db
+          echo "db created at default location"
           docker logs relay-smoke > /tmp/smoke.log 2>&1 || true
           docker rm -f relay-smoke > /dev/null

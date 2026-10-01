@@ -69,6 +69,72 @@ def test_missing_env_var_names_var_and_key(tmp_path, monkeypatch):
         load_config(write_config(tmp_path, text))
 
 
+def redfish_password_config(password_expr):
+    return VALID.replace("type: noop", "type: redfish").replace(
+        """    power:
+      initial_state: on""",
+        f"""    power:
+      host: 127.0.0.1
+      user: u
+      password: {password_expr}""",
+    )
+
+
+def test_default_used_when_env_var_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPT_SECRET", raising=False)
+    config = load_config(write_config(tmp_path, redfish_password_config("${OPT_SECRET:-fb}")))
+    power = config.servers[0].power
+    assert isinstance(power, RedfishPowerConfig)
+    assert power.password == "fb"
+
+
+def test_default_used_when_env_var_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPT_SECRET", "")
+    config = load_config(write_config(tmp_path, redfish_password_config("${OPT_SECRET:-fb}")))
+    assert config.servers[0].power.password == "fb"  # type: ignore[union-attr]
+
+
+def test_set_env_var_wins_over_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPT_SECRET", "s3cret")
+    config = load_config(write_config(tmp_path, redfish_password_config("${OPT_SECRET:-fb}")))
+    assert config.servers[0].power.password == "s3cret"  # type: ignore[union-attr]
+
+
+def test_empty_default_yields_empty_value(tmp_path, monkeypatch):
+    # The optional-auth case: an unset secret must not break startup.
+    monkeypatch.delenv("OPT_PASSWORD", raising=False)
+    text = (
+        VALID
+        + """
+clients:
+  - name: opencode
+    status:
+      kind: none
+      password: ${OPT_PASSWORD:-}
+"""
+    )
+    config = load_config(write_config(tmp_path, text))
+    assert config.clients[0].status.password == ""
+
+
+def test_store_path_default_when_env_unset(tmp_path, monkeypatch):
+    # The reported boot failure: ${RELAY_DB_PATH:-...} with the var unset.
+    monkeypatch.delenv("RELAY_DB_PATH", raising=False)
+    text = VALID.replace(
+        "  port: 8000", "  port: 8000\n  store:\n    path: ${RELAY_DB_PATH:-./relay.db}"
+    )
+    config = load_config(write_config(tmp_path, text))
+    assert config.proxy.store.path == "./relay.db"
+
+
+def test_unsupported_env_reference_fails_loudly(tmp_path, monkeypatch):
+    # An unrecognized ${...} form must error, never pass through as a literal.
+    monkeypatch.delenv("BAD-NAME", raising=False)
+    text = VALID.replace("path_prefix: /v1", "path_prefix: /${BAD-NAME}")
+    with pytest.raises(ConfigError, match="unsupported environment reference"):
+        load_config(write_config(tmp_path, text))
+
+
 def test_env_files_next_to_config_are_loaded(tmp_path, monkeypatch):
     monkeypatch.delenv("FILE_ONLY_VAR", raising=False)
     (tmp_path / "secrets.env").write_text("FILE_ONLY_VAR=from-file\n")
