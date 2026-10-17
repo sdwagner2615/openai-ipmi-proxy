@@ -115,7 +115,7 @@ class NoopPowerConfig:
 
 @dataclass
 class AwsEc2PowerConfig:
-    """Power config for `type: aws-ec2` servers (Phase 2 backend)."""
+    """Power config for `type: aws-ec2` servers (D10)."""
 
     region: str
     instance_id: str
@@ -126,6 +126,9 @@ class AwsEc2PowerConfig:
     profile: str | None = None
     # stop (default) | terminate
     off_action: str = "stop"
+    # Optional custom EC2 API endpoint (the test fake, localstack, or a
+    # compatible gateway); unset = the real AWS endpoint for `region`.
+    endpoint_url: str | None = None
 
 
 PowerConfig = RedfishPowerConfig | NoopPowerConfig | AwsEc2PowerConfig

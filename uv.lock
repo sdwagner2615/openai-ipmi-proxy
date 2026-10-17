@@ -1076,6 +1076,7 @@ aws = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "boto3" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1101,6 +1102,7 @@ provides-extras = ["aws"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "boto3", specifier = ">=1.34" },
     { name = "mypy", specifier = ">=1.10" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
