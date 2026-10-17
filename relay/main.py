@@ -17,7 +17,7 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from relay.clients import StatusPoller, provider_from_config, providers_from_config
+from relay.clients import ClientRegistry, StatusPoller, provider_from_config
 from relay.config import ConfigError, load_config
 from relay.endpoints import EndpointRuntime, route
 from relay.models import RelayConfig
@@ -50,7 +50,7 @@ class RelayApp:
                 self.store,
                 shutdown_tick=config.proxy.shutdown_tick,
             )
-        self.providers = providers_from_config(config.clients)
+        self.registry = ClientRegistry(config.clients, config.proxy.session_id_headers)
         self.pollers: dict[str, StatusPoller] = {}
         self.endpoints: dict[str, EndpointRuntime] = {}
         self.catch_all: EndpointRuntime | None = None
@@ -83,8 +83,7 @@ class RelayApp:
                 http_client=http_client,
                 store=self.store,
                 pollers=self.pollers,
-                providers=self.providers,
-                generic_headers=self.config.proxy.session_id_headers,
+                registry=self.registry,
                 unknown_tracker=self.unknown_tracker,
                 read_timeout=self.target_read_timeout,
             )
