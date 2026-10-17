@@ -42,7 +42,7 @@ later puts the box to sleep when the work is genuinely done.
   configuration, sessions in queue order with spot state, manual spot
   release, per-cycle auto-off switch, live target read timeout.
 - **Server types.** `redfish` (MegaRAC-style BMCs), `noop` (dev/tests), and
-  `aws-ec2` (Phase 2, via the `relay[aws]` extra — included in the image).
+  `aws-ec2` (via the `relay[aws]` extra — included in the image).
 
 ## Quick start (Docker)
 
@@ -77,6 +77,30 @@ Three inputs, one rule: **`config.yaml` owns topology + policy**,
 (referenced from config via `${VAR}`). The full annotated reference,
 validation rules, and the old-env-var → new-location migration map live in
 [docs/relay/configuration.md](docs/relay/configuration.md).
+
+## AWS EC2 servers
+
+`type: aws-ec2` manages an instance's power through the EC2 API (boto3,
+the optional `relay[aws]` extra — included in the Docker image). CI
+exercises the backend against in-process fakes and a fake EC2 API server
+(never real AWS); before trusting one in production, run the manual smoke
+once:
+
+1. Configure the server (`region` + `instance_id` + `access_key`/`secret_key`
+   or `profile`, `service_url`, `off_action: stop` — `terminate` is
+   irreversible; see
+   [docs/relay/configuration.md](docs/relay/configuration.md)).
+2. Boot relay; open `GET /monitor` (or `GET /monitor/data`).
+3. Send one request through the proxy while the instance is `stopped`:
+   relay issues `start_instances`, the monitor shows the server
+   `powering_on` → `on` as the instance goes `pending` → `running`, and the
+   request is served once the service's readiness path answers.
+4. Leave it idle past `idle_timeout`: relay issues `stop_instances`
+   (`terminate_instances` when `off_action: terminate`), releases ownership,
+   and records a `power_off` event with reason `idle_timeout`. Confirm the
+   instance actually stopped in the AWS console.
+5. Exercise the monitor's manual on/off (`POST /monitor/power`) to verify
+   ownership bookkeeping (a manual on takes ownership, D12).
 
 ## Pointing opencode at relay
 
