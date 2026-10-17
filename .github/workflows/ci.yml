@@ -61,12 +61,18 @@ jobs:
           set -e
           docker run -d --name relay-smoke -p 8000:8000 \
             -v $GITHUB_WORKSPACE/smoke/config.yaml:/config/config.yaml:ro relay-ci
+          ok=1
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then
+              ok=0
               break
             fi
             sleep 1
           done
+          if [ "$ok" -ne 0 ]; then
+            docker logs relay-smoke
+            exit 1
+          fi
           curl -sf http://127.0.0.1:8000/healthz
           echo
           curl -sf http://127.0.0.1:8000/monitor/data | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'config' in d and 'sessions' in d"

@@ -1,5 +1,5 @@
 .env
-config.yaml
+/config.yaml
 secrets.env
 *.db
 __pycache__/
