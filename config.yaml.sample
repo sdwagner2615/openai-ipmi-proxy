@@ -42,7 +42,8 @@ servers:
     # schedule: "0 2 * * *"    # 5-field cron off-time (Phase 1); defers while
                                # active; null/omitted = no schedule
     #
-    # Example: AWS EC2 server (Phase 2 — requires the `relay[aws]` extra):
+    # Example: AWS EC2 server (requires the `relay[aws]` extra; the Docker
+    # image ships it by default):
     #
     # - name: ec2-gpu
     #   type: aws-ec2
@@ -53,6 +54,9 @@ servers:
     #     secret_key: ${AWS_SECRET_ACCESS_KEY}
     #     # session_token: ${AWS_SESSION_TOKEN}   # optional
     #     # profile: my-aws-profile               # alternative to explicit keys
+    #     # endpoint_url: http://127.0.0.1:8103   # optional custom EC2 API
+    #                                            # endpoint (test fake /
+    #                                            # localstack); unset = real AWS
     #     off_action: stop             # stop (default) | terminate
     #   service_url: http://10.0.0.5:80
     #   idle_timeout: 1800

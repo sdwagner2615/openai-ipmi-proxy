@@ -2,9 +2,21 @@
 
 Phase 0 status: **complete** — gate green (ruff + mypy, 80 unit tests, 26
 e2e tests, container smoke). Phase 1 status: **complete** — gate green
-(ruff + mypy, 104 unit tests, 39 e2e tests, container smoke). This file
-tracks completed tasks, deviations from the design docs, and open questions,
-per `phases.md`.
+(ruff + mypy, 104 unit tests, 39 e2e tests, container smoke). Phase 2
+status: **complete** — gate green (ruff + mypy, 120 unit tests, 40 e2e
+tests, container smoke). This file tracks completed tasks, deviations from
+the design docs, and open questions, per `phases.md`.
+
+## Completed (Phase 2)
+
+| Area | What landed |
+|---|---|
+| EC2 power backend (`power/aws_ec2.py`, D10) | boto3 client (keys or profile; adaptive retries for throttling), every call via `asyncio.to_thread`; `start_instances` / `stop_instances` / `terminate_instances` per `off_action`; state map `pending/running→on`, `stopping/stopped/shutting-down→off`, `terminated→off` + irreversible flag, anything else→`unknown`; unreachable API → `unknown` (state) / refused (action) |
+| Registry + config (`power/__init__.py`, `models.py`, `config.py`) | `aws-ec2` registered with a **lazy** boto3 import (the extra stays optional; configuring it without `relay[aws]` fails at startup with a clear error); new optional `power.endpoint_url` field (fake / localstack / gateway) |
+| Fake EC2 (`tests/mocks/fake_ec2.py`) | in-process `FakeEc2Client` (unit tests) **and** a standalone AWS Query-protocol server a *real* boto3 client talks to (e2e, like `mock_bmc.py`): `stopped→pending→running` boot delay, `stopping→stopped`, `terminated`, plus `/state` `/actions` `/set` inspection |
+| EC2 unit tests (`tests/unit/test_power_ec2.py`, 16 tests) | state map (incl. unknown string → `unknown`), start/stop/terminate action selection, terminated refuses power-on (via observed state and via a successful terminate), unreachable API → `unknown`/`False`, close idempotent |
+| E2E boot latency (`test_multi_server.py::test_ec2_boot_latency`, `ec2_env` fixture) | real proxy subprocess + real boto3 client against the fake EC2 API: a request triggers `start_instances`, the instance boots `pending→running` while the target is DOWN (endpoint stays not-ready), and the request is served only after the target starts — the wait-and-poll path with a slow boot |
+| Deps + docs | `boto3` in the dev dependency group (CI runs the EC2 tests via fakes; still an optional *runtime* extra); README "AWS EC2 servers" section with the manual real-instance smoke (out of CI); `endpoint_url` in `configuration.md` + `config.yaml.sample` |
 
 ## Completed (Phase 1)
 
@@ -119,9 +131,35 @@ deterministic.
     UA + source IP. WS URLs commonly carry ids/tokens in the query string
     because many clients cannot set headers on an upgrade.
 
+## Phase 2 notes
+
+12. **The EC2 state map uses the real EC2 state names.** `phases.md` listed
+    `shut-down` / `expired`, which are not EC2 instance states; the
+    implementation maps the six real ones (`pending`, `running`,
+    `shutting-down`, `stopping`, `stopped`, `terminated`) and treats any
+    other string as `unknown` (never act on unknown, D14). `pending` maps to
+    **on** (booting) so the queue manager does not re-issue
+    `start_instances` while the instance comes up (D8); readiness — the
+    other signal — gates actual serving.
+
+13. **`terminated` is an irreversible off.** With `off_action: terminate`
+    the backend tracks the terminated state (from a `describe_instances`
+    observation or a successful `terminate_instances`); while terminated,
+    `power_on` refuses (`False`, no API call) because a terminated instance
+    can never be started.
+
+14. **`endpoint_url` power field (config addition).** The aws-ec2 power
+    block accepts an optional `endpoint_url` so the real boto3 client can
+    point at the fake EC2 API (the e2e boot-latency case) or at localstack /
+    a compatible gateway; unset = the real AWS endpoint for `region`.
+
+15. **boto3 in the dev dependency group.** The dev group carries `boto3` so
+    CI (`uv sync --frozen`) can run the EC2 unit/e2e tests via the fakes; it
+    remains an optional *runtime* extra (`relay[aws]`) — the package imports
+    it lazily, only when an aws-ec2 server is configured.
+
 ## Open / deferred
 
-- `aws-ec2` backend, fake, e2e case — Phase 2.
 - Client generalization (`StatusSource` plugin, config-driven entries) —
   Phase 3.
 - E2E suite runtime: ~6.5 min locally (real subprocesses, by design; the cron
@@ -130,12 +168,14 @@ deterministic.
 ## Verification
 
 - Gate: `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-  green; `uv run pytest -m unit` 104 passed; `uv run pytest -m e2e` 39 passed
+  green; `uv run pytest -m unit` 120 passed; `uv run pytest -m e2e` 40 passed
   (multiple consecutive full runs).
 - Parity: faithful port of every legacy harness scenario (T1–T21, T23, T24)
   plus boot-wait and adoption (unknown-path) suites; the old harness runs
   green on the pre-rework tree for comparison. Phase 1 adds the shutdown,
-  WebSocket, and multi-server suites (5 + 5 + 3 e2e tests).
+  WebSocket, and multi-server suites (5 + 5 + 3 e2e tests). Phase 2 adds the
+  EC2 unit suite (16 tests) and the EC2 boot-latency e2e case (1 test, real
+  boto3 against the fake EC2 API — never real AWS).
 - Container: image builds (uv, non-root, aws extra), boots with the noop
   smoke config, `/healthz` 200, `/monitor/data` parses, default DB path
   exercised.
