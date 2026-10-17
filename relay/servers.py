@@ -7,10 +7,9 @@ One ServerRuntime per configured server (D2/D3). Owns:
 - ownership (D12) and the per-cycle ``shutdown_override`` (D14),
 - the single power-on cooldown timer (P2),
 - the power-state sync loop (~5s),
-- the idle-off shutdown engine (60s tick, P9-P12).
-
-The cron off-time half of the shutdown engine (D11b) arrives with
-``scheduler.py`` in Phase 1; the idle-off half runs here from Phase 0.
+- the shutdown engine (``shutdown_tick`` cadence, default 60s): the idle-off
+  half (P9-P12) and the cron off-time half (D11b, ``relay/scheduler.py``)
+  with deferral while the server is active.
 """
 
 from __future__ import annotations
@@ -19,10 +18,12 @@ import asyncio
 import logging
 import time
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from relay.models import ServerConfig
 from relay.power.base import PowerBackend, PowerState
+from relay.scheduler import CronSchedule
 from relay.store import ServerRuntimeRow, Store
 
 if TYPE_CHECKING:
@@ -72,6 +73,11 @@ class ServerRuntime:
         self.owned = False
         self.shutdown_override: bool | None = None
         self.cycle_id: str | None = None
+        # Cron off-time (D11b): parsed schedule + deferral bookkeeping. Cron is
+        # a calendar time (wall clock); the idle clock above stays monotonic (P11).
+        self._cron = CronSchedule(config.schedule) if config.schedule else None
+        self.last_fired_cron: datetime | None = None
+        self.schedule_deferred = False
         # Idle clock (P11: monotonic; anchored at startup, refreshed by
         # routed traffic and by activity seen in the shutdown tick).
         self.last_activity = time.monotonic()
@@ -303,17 +309,103 @@ class ServerRuntime:
         await self.store.log_power_event(self.name, action, "poll", initiated_by, True)
 
     async def shutdown_loop(self) -> None:
-        """Per-server idle-off engine (60s tick; P9-P12)."""
+        """Per-server shutdown engine (``shutdown_tick`` cadence; P9-P12, D11b).
+
+        Each pass evaluates the cron off-time (deferring while active), then the
+        idle-off rule. A transient error never kills the loop.
+        """
         while True:
             try:
-                await self._idle_off_tick()
+                await self._shutdown_tick()
             except Exception:
                 logger.exception("Shutdown check for %s failed; continuing.", self.name)
             await asyncio.sleep(self.shutdown_tick)
 
+    async def _shutdown_tick(self) -> None:
+        """One shutdown pass: scheduled (cron) off first, then idle off."""
+        await self._schedule_off_tick()
+        await self._idle_off_tick()
+
     def has_activity(self) -> bool:
         """True while any endpoint has queued work, in-flight traffic, or held slots."""
         return any(ep.has_activity() for ep in self.endpoints)
+
+    async def _can_power_off(self) -> bool:
+        """Shared shutdown gating (D12/D14, P10).
+
+        True only when the server is owned, auto-off is on for this cycle, and
+        the actual power state verifies as ON. Off (already off) and unknown
+        (skip to be safe) both return False.
+        """
+        if not self.owned or not self.shutdown_enabled_now:
+            return False
+        actual = await self.backend.power_state()
+        if actual is not PowerState.ON:
+            if actual is PowerState.UNKNOWN:
+                logger.warning(
+                    "Server %s: cannot verify power state; skipping shutdown to be safe.",
+                    self.name,
+                )
+            return False
+        return True
+
+    def next_scheduled_off(self) -> datetime | None:
+        """The next cron off-time for the monitor, or None when unscheduled."""
+        if self._cron is None:
+            return None
+        try:
+            return self._cron.next_fire(datetime.now())
+        except Exception:
+            logger.exception("Failed to compute next scheduled off for %s", self.name)
+            return None
+
+    async def _schedule_off_tick(self, now: datetime | None = None) -> None:
+        """Cron off-time evaluation (D11b), deferring while the server is active.
+
+        Baselines at startup so only fires after boot count. When a fire elapses
+        while the server has activity, the off is deferred and issued at the next
+        idle moment; otherwise it fires immediately. ``now`` is injectable for
+        unit tests (default: wall clock).
+        """
+        if self._cron is None:
+            return
+        now = now or datetime.now()
+        if self.last_fired_cron is None:
+            self.last_fired_cron = now
+            return
+        prev_fire = self._cron.last_fire_before(now)
+        if prev_fire <= self.last_fired_cron:
+            # No new fire. A previously deferred off fires once the server idles.
+            if self.schedule_deferred and not self.has_activity():
+                if await self._can_power_off():
+                    logger.info(
+                        "Server %s: deferred scheduled off, now idle; shutting down.",
+                        self.name,
+                    )
+                    await self.power_off(reason="schedule")
+                self.schedule_deferred = False
+            return
+        # A new fire occurred after the last acted-on fire.
+        if self.has_activity():
+            self.schedule_deferred = True
+            self.last_fired_cron = prev_fire
+            logger.info(
+                "Server %s: scheduled off (%s) deferred while active.",
+                self.name,
+                prev_fire.isoformat(timespec="seconds"),
+            )
+            return
+        if await self._can_power_off():
+            logger.info("Server %s: scheduled off time reached; shutting down.", self.name)
+            await self.power_off(reason="schedule")
+        else:
+            logger.info(
+                "Server %s: scheduled off skipped (not owned, auto-off off, "
+                "or power state not verified ON).",
+                self.name,
+            )
+        self.last_fired_cron = prev_fire
+        self.schedule_deferred = False
 
     async def _idle_off_tick(self) -> None:
         now = time.monotonic()

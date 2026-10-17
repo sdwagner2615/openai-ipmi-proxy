@@ -1,8 +1,22 @@
 # Implementation Progress
 
 Phase 0 status: **complete** — gate green (ruff + mypy, 80 unit tests, 26
-e2e tests, container smoke). This file tracks completed tasks, deviations
-from the design docs, and open questions, per `phases.md`.
+e2e tests, container smoke). Phase 1 status: **complete** — gate green
+(ruff + mypy, 104 unit tests, 39 e2e tests, container smoke). This file
+tracks completed tasks, deviations from the design docs, and open questions,
+per `phases.md`.
+
+## Completed (Phase 1)
+
+| Area | What landed |
+|---|---|
+| Scheduler + shutdown engine (`scheduler.py`, `servers.py`) | 60s-per-server tick (configurable via `proxy.shutdown_tick`, default 60); idle off (owned, override on, actual-state verified, unknown skipped); cron off via croniter with **deferral while active**; fake-clock unit tests (`tests/unit/test_scheduler.py`, 13 tests) |
+| Request logging + batched flusher (`store.py`, `transport/http.py`, `endpoints.py`) | `RequestRecord` staged per completed request (wait_s, active_s, status, bytes), flushed ~1/s in one transaction and drained on shutdown; per-endpoint session upsert |
+| Monitor v2 (`monitor.py`, `main.py`) | servers table (power, owned, idle countdown, next scheduled off, per-cycle toggle, manual on/off), endpoints table (ready, queue depth, free slots, policies), sessions per endpoint, unknown activity, recent `power_events`; new `POST /monitor/power` (manual on/off ⇒ ownership per D12); v1 `config` surface preserved for parity |
+| Shutdown e2e (`test_shutdown.py`) | idle off, manual-on untouched, per-cycle toggle blocks off, restart restores ownership + override, cron off (per-minute, ~60s) |
+| WebSocket transport (`transport/ws.py`, `endpoints.py`, `main.py`) | catch-all `@app.websocket("/{path:path}")` mirroring HTTP routing; accept-then-ping keep-alive while waiting; close 1013 on the error policy; bidirectional frame pump; slot held for the connection lifetime; session id from headers **and** query params; `tests/mocks/mock_ws_target.py` |
+| WS e2e (`test_ws.py`) | echo tunnel, keep-alive while the target boots, 1013 on error policy, slot held for connection lifetime, query-param session id |
+| Multi-server e2e (`test_multi_server.py`, `multi_env` fixture) | two servers (redfish mock-BMC + noop) on one proxy: longest-prefix routing + independent readiness, isolated per-endpoint queues, independent per-server shutdowns (shutting one down never touches the other) |
 
 ## Completed (Phase 0)
 
@@ -81,23 +95,47 @@ deterministic.
    `ready` flips true during a tick; entries already in the queue were
    previously promoted only by a new admission.
 
+## Phase 1 notes
+
+9. **Shutdown `power_events` reason strings.** `phases.md` named the idle and
+   cron off reasons `idle_off` / `schedule_off`; the implementation logs
+   `idle_timeout` (idle off) and `schedule` (cron off), with `manual` for the
+   monitor's `POST /monitor/power`. `reason` is a free-form `Text` column (no
+   enum), so this is a naming choice, not a schema constraint. The e2e suite
+   asserts on `schedule` / `idle_timeout`.
+
+10. **WS keep-alive ping goes through Starlette's private `_send`.** While a
+    connection is held (wait policy) the proxy emits `websocket.ping` ASGI
+    frames to keep idle intermediaries from timing it out. Starlette's public
+    `WebSocket.send()` rejects `websocket.ping` once the socket is `CONNECTED`,
+    so the ping is written via `websocket._send(...)` wrapped in
+    `contextlib.suppress(Exception)` — a missing/unsupported ping must never
+    break the hold (the connection stays open regardless).
+
+11. **WS session id mirrors the configured header names as query params.**
+    `resolve_session_id_ws` resolves a session from (1) a white-glove client's
+    headers, (2) the configured generic headers, (3) WS query params that
+    mirror those same header names (white-glove first, then generic), and (4)
+    UA + source IP. WS URLs commonly carry ids/tokens in the query string
+    because many clients cannot set headers on an upgrade.
+
 ## Open / deferred
 
-- `requests`/`sessions` table writes + flusher batching — Phase 1 (task 7).
-- Scheduler (cron off + deferral) + shutdown-engine e2e — Phase 1.
-- WebSocket transport, monitor v2 — Phase 1.
 - `aws-ec2` backend, fake, e2e case — Phase 2.
 - Client generalization (`StatusSource` plugin, config-driven entries) —
   Phase 3.
-- E2E suite runtime: ~4.5 min locally (real subprocesses, by design).
+- E2E suite runtime: ~6.5 min locally (real subprocesses, by design; the cron
+  and multi-server scenarios wait on real 1s/60s cadences).
 
 ## Verification
 
 - Gate: `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-  green; `uv run pytest -m unit` 80 passed; `uv run pytest -m e2e` 26 passed
-  (multiple consecutive full runs after the poll-cadence fix).
+  green; `uv run pytest -m unit` 104 passed; `uv run pytest -m e2e` 39 passed
+  (multiple consecutive full runs).
 - Parity: faithful port of every legacy harness scenario (T1–T21, T23, T24)
   plus boot-wait and adoption (unknown-path) suites; the old harness runs
-  green on the pre-rework tree for comparison.
+  green on the pre-rework tree for comparison. Phase 1 adds the shutdown,
+  WebSocket, and multi-server suites (5 + 5 + 3 e2e tests).
 - Container: image builds (uv, non-root, aws extra), boots with the noop
-  smoke config, `/healthz` 200, `/monitor/data` parses.
+  smoke config, `/healthz` 200, `/monitor/data` parses, default DB path
+  exercised.

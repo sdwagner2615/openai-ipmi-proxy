@@ -15,6 +15,7 @@ concurrent readers during writes.
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,25 @@ from relay.db import (
 
 logger = logging.getLogger("relay.store")
 
-__all__ = ["ServerRuntimeRow", "Store"]
+__all__ = ["RequestRecord", "ServerRuntimeRow", "Store"]
 
 _UNSET: Any = object()
+
+
+@dataclass
+class RequestRecord:
+    """One completed proxied request, staged for batched insert (D13)."""
+
+    ts: float
+    server: str
+    endpoint: str
+    client: str
+    session_id: str
+    wait_seconds: float
+    active_seconds: float
+    status_code: int | None
+    request_bytes: int
+    response_bytes: int
 
 
 class ServerRuntimeRow:
@@ -69,6 +86,8 @@ class Store:
         self._engine: AsyncEngine | None = None
         self._sessionmaker: async_sessionmaker[AsyncSession] | None = None
         self._write_lock = asyncio.Lock()
+        # Staged request rows, flushed to disk in batches by request_flush_loop.
+        self._request_buffer: list[RequestRecord] = []
 
     @property
     def path(self) -> str:
@@ -241,36 +260,93 @@ class Store:
             for e in reversed(events)
         ]
 
-    # -- requests / sessions (written from Phase 1 onward) ---------------------
+    # -- requests / sessions (the store flusher, Phase 1 task 7) ---------------
 
-    async def log_request(
-        self,
-        *,
-        server: str,
-        endpoint: str,
-        client: str,
-        session_id: str,
-        wait_seconds: float,
-        active_seconds: float,
-        status_code: int,
-        request_bytes: int,
-        response_bytes: int,
-    ) -> None:
+    async def enqueue_request(self, record: RequestRecord) -> None:
+        """Stages one completed request for batched insert (single-loop safe)."""
+        self._request_buffer.append(record)
+
+    async def flush_requests(self) -> int:
+        """Writes the staged request buffer in one transaction; returns the count."""
+        records, self._request_buffer = self._request_buffer, []
+        if not records:
+            return 0
+        return await self.bulk_log_requests(records)
+
+    async def bulk_log_requests(self, records: list[RequestRecord]) -> int:
+        """Inserts a batch of request rows in a single transaction."""
+        if not records:
+            return 0
         async with self._write_lock, self._sessions()() as session, session.begin():
-            session.add(
+            session.add_all(
                 RequestLog(
-                    ts=time.time(),
-                    server=server,
-                    endpoint=endpoint,
-                    client=client,
-                    session_id=session_id,
-                    wait_seconds=wait_seconds,
-                    active_seconds=active_seconds,
-                    status_code=status_code,
-                    request_bytes=request_bytes,
-                    response_bytes=response_bytes,
+                    ts=r.ts,
+                    server=r.server,
+                    endpoint=r.endpoint,
+                    client=r.client,
+                    session_id=r.session_id,
+                    wait_seconds=r.wait_seconds,
+                    active_seconds=r.active_seconds,
+                    status_code=r.status_code,
+                    request_bytes=r.request_bytes,
+                    response_bytes=r.response_bytes,
                 )
+                for r in records
             )
+        return len(records)
+
+    async def upsert_session(self, client: str, session_id: str, endpoint: str) -> None:
+        """Touches the session-history row for a tracked session (create/update)."""
+        now = time.time()
+        stmt = sqlite_insert(SessionRecord).values(
+            client=client,
+            session_id=session_id,
+            endpoint=endpoint,
+            first_seen=now,
+            last_seen=now,
+            request_count=1,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["client", "session_id", "endpoint"],
+            set_={"last_seen": now, "request_count": SessionRecord.request_count + 1},
+        )
+        async with self._write_lock, self._engine_live().begin() as conn:
+            await conn.execute(stmt)
+
+    async def request_flush_loop(self, interval: float = 1.0) -> None:
+        """Flushes staged request rows on a fixed cadence (the store flusher).
+
+        A transient error must never kill the loop.
+        """
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.flush_requests()
+            except Exception:
+                logger.exception("Request flush failed; continuing.")
+
+    async def get_requests(self, limit: int = 100) -> list[dict]:
+        """Most recent request rows (monitor / tests)."""
+        async with self._sessions()() as session:
+            result = await session.execute(
+                select(RequestLog).order_by(RequestLog.id.desc()).limit(limit)
+            )
+            rows = result.scalars().all()
+        return [
+            {
+                "ts": r.ts,
+                "server": r.server,
+                "endpoint": r.endpoint,
+                "client": r.client,
+                "session_id": r.session_id,
+                "wait_seconds": r.wait_seconds,
+                "active_seconds": r.active_seconds,
+                "status_code": r.status_code,
+                "request_bytes": r.request_bytes,
+                "response_bytes": r.response_bytes,
+            }
+            for r in reversed(rows)
+        ]
 
     # -- retention -------------------------------------------------------------
 

@@ -283,6 +283,7 @@ def _build_proxy(raw: dict) -> ProxyConfig:
             h.lower()
             for h in _get_str_list(raw, "session_id_headers", where, default=["x-session-id"])
         ],
+        shutdown_tick=_get_float(raw, "shutdown_tick", where, default=60.0, minimum=0.1),
         store=StoreConfig(
             path=store_path,
             retention_days=_get_int(
