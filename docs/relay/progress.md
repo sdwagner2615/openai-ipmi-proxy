@@ -4,8 +4,23 @@ Phase 0 status: **complete** — gate green (ruff + mypy, 80 unit tests, 26
 e2e tests, container smoke). Phase 1 status: **complete** — gate green
 (ruff + mypy, 104 unit tests, 39 e2e tests, container smoke). Phase 2
 status: **complete** — gate green (ruff + mypy, 120 unit tests, 40 e2e
-tests, container smoke). This file tracks completed tasks, deviations from
-the design docs, and open questions, per `phases.md`.
+tests, container smoke). Phase 3 status: **complete** — gate green
+(ruff + mypy, 144 unit tests, 49 e2e tests). This file tracks completed
+tasks, deviations from the design docs, and open questions, per
+`phases.md`.
+
+## Completed (Phase 3)
+
+| Area | What landed |
+|---|---|
+| `ClientRegistry` (`clients.py`, D20/D22) | white-glove matching (plain + UA-gated headers, config order, first match wins) and the full D22 session-id resolution (white-glove headers → generic headers → endpoint body fields → WS query params → `ua\|ip`) now live on one object; `extract_body_field` moved alongside it. `endpoints.py` no longer carries resolution logic — the endpoint runtime takes the registry instead of provider/header lists |
+| `StatusSource` ABC (`clients.py`, D21) | the pluggable per-client status contract: `fetch_session_info` / `fetch_statuses` / `fetch_pending`, the normalized `StatusReport`, context + parent-id caches, start-to-start poll stamping. The queue manager drives status polling through the interface only — no opencode vocabulary left in `queue.py` / `main.py` / `endpoints.py`; `resolve_shared_spot` reads the parent chain via `source.parent_of` |
+| `OpencodeStatusSource` (`status_opencode.py`) | the parity reference implementation, moved out of the core: per-directory context resolution, status-map normalization (busy / retry + attempt detail), pending endpoints, basic auth (fixed user `opencode`); `create_status_source` is the single place that reads `status.kind` |
+| `kind: none` (feat) | configured clients without a status source: identified and scoped by name but busy-window inference only — `Session.known` records whether the client has a status source, and the queue's status/deadline logic keys off it (see note 17 for the behavior this fixed) |
+| E2E `test_opencode.py` (9 tests) | every `parity.md` §client-status behavior against the generalized stack, with config-driven client entries: C1 per-directory maps + cached contexts, C2 absence = idle, C3 pending-input tie-breaker, C4 the 30s unreachable grace (dedicated killable status mock), C5 poll grouping + cache pruning (mock request counters), C7 waiting-for-input release regardless of the flag, C8 retry surfacing + spot retention past expiry, Q8 parent-chain shared spots, and a `kind: none` client alongside opencode |
+| Mock + fixture | `mock_opencode.py` extended (backward-compatible): per-session directories, `/offline` switch, per-endpoint `/fail` (partial failures), `/requests` counter; new `oc_env` e2e fixture gives each scenario isolated target + BMC + both status mocks |
+| Unit | `test_status_opencode.py` (15 tests, MockTransport: fetch contracts, normalization, auth, caching, factory); D22 resolution incl. WS query params in `test_session_id.py`; `clients:` validation in `test_config.py`; `kind: none` deadlines in `test_queue.py` |
+| Docs | `configuration.md` `kind: none` note; README "White-glove clients (config-driven)" section |
 
 ## Completed (Phase 2)
 
@@ -158,24 +173,51 @@ deterministic.
     remains an optional *runtime* extra (`relay[aws]`) — the package imports
     it lazily, only when an aws-ec2 server is configured.
 
+## Phase 3 notes
+
+16. **Unrecognized status entries are not reported.** The legacy manager
+    kept a session's last-known state when its map entry was present but its
+    `type` was not busy/idle/retry; the normalized source only reports
+    recognized types, so such an entry now counts as "not active in this
+    map" (an idle report). Opencode only emits busy/retry (and the mock only
+    ever does), so this is unobservable in practice — recorded for
+    completeness.
+17. **`kind: none` fix: named clients without a status source use
+    busy-window inference.** Before Phase 3, any client with a configured
+    name was treated as "known" by the queue (`client != "unknown"`): a
+    `status.kind: none` client's sessions went idle the moment the last
+    response finished, ignoring `busy_window` entirely. `Session.known`
+    records whether the client has a status source, and the queue's
+    status/deadline logic keys off it, so report-less named clients follow
+    the unknown-client rule (busy window, then
+    `max(busy_window, expiry)` release).
+18. **`oc_env` e2e fixture: per-scenario isolated mocks.** Each scenario
+    gets its own mock target, mock BMC, and both opencode status mocks, so
+    the `/offline` switch, per-directory maps, and request counters start
+    clean. The C4 unreachable-grace test takes ~40s of real time by design
+    (the 30s grace is a parity constant, not configurable).
+
 ## Open / deferred
 
-- Client generalization (`StatusSource` plugin, config-driven entries) —
-  Phase 3.
-- E2E suite runtime: ~6.5 min locally (real subprocesses, by design; the cron
-  and multi-server scenarios wait on real 1s/60s cadences).
+- E2E suite runtime: ~9 min locally (real subprocesses, by design; the cron
+  and multi-server scenarios wait on real 1s/60s cadences, and the Phase-3
+  unreachable-grace case waits out the 30s parity constant).
 
 ## Verification
 
 - Gate: `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-  green; `uv run pytest -m unit` 120 passed; `uv run pytest -m e2e` 40 passed
+  green; `uv run pytest -m unit` 144 passed; `uv run pytest -m e2e` 49 passed
   (multiple consecutive full runs).
 - Parity: faithful port of every legacy harness scenario (T1–T21, T23, T24)
   plus boot-wait and adoption (unknown-path) suites; the old harness runs
   green on the pre-rework tree for comparison. Phase 1 adds the shutdown,
   WebSocket, and multi-server suites (5 + 5 + 3 e2e tests). Phase 2 adds the
   EC2 unit suite (16 tests) and the EC2 boot-latency e2e case (1 test, real
-  boto3 against the fake EC2 API — never real AWS).
+  boto3 against the fake EC2 API — never real AWS). Phase 3 adds
+  `test_opencode.py` (9 e2e tests covering every §client-status behavior
+  against the generalized stack, incl. a `kind: none` client alongside
+  opencode) and the status-source unit suite (15 tests); every previously
+  ported test stays green untouched.
 - Container: image builds (uv, non-root, aws extra), boots with the noop
   smoke config, `/healthz` 200, `/monitor/data` parses, default DB path
   exercised.
