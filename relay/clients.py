@@ -46,8 +46,11 @@ therefore run its opencode server on a reachable interface (e.g.
 (127.0.0.1, random port) is not reachable from the proxy.
 """
 
+import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -59,8 +62,10 @@ logger = logging.getLogger("relay.clients")
 __all__ = [
     "STATUS_UNREACHABLE_GRACE",
     "ClientProvider",
+    "ClientRegistry",
     "StatusPoller",
     "detect_client",
+    "extract_body_field",
     "providers_from_config",
     "resolve_shared_spot",
     "session_header_value",
@@ -146,6 +151,95 @@ def session_header_value(provider: ClientProvider, headers: dict) -> str | None:
         value = lowered.get(header)
         if value:
             return value
+    return None
+
+
+class ClientRegistry:
+    """White-glove client matching and session-id resolution (D20/D22).
+
+    Built from the ``clients:`` config entries (config order — first match
+    wins) and the proxy's generic session-id headers. A matched client's
+    status source (D21) is looked up separately, by client name.
+    """
+
+    def __init__(self, clients: list[ClientConfig], generic_headers: list[str]):
+        self.providers = [provider_from_config(client) for client in clients]
+        self.by_name: dict[str, ClientProvider] = {
+            provider.name: provider for provider in self.providers
+        }
+        self.generic_headers = tuple(h.lower() for h in generic_headers)
+
+    def match(self, headers: dict) -> ClientProvider | None:
+        """The white-glove client identified by the headers, else None."""
+        return detect_client(headers, self.providers)
+
+    def session_id(self, provider: ClientProvider, headers: dict) -> str | None:
+        """The session id carried in the provider's headers, else None."""
+        return session_header_value(provider, headers)
+
+    def resolve(
+        self,
+        headers: dict,
+        client_ip: str,
+        body: bytes | None = None,
+        body_fields: tuple[str, ...] = (),
+        query: Mapping[str, str] | None = None,
+    ) -> tuple[str, str]:
+        """Identifies the (client, session id) for a request (S1, D22).
+
+        Precedence: (1) the matched white-glove client's own session headers
+        (plain, then UA-gated), (2) the configured generic session headers,
+        (3) the endpoint's body fields (HTTP only), (4) query params mirroring
+        those header names (WebSockets only — WS URLs carry ids/tokens in the
+        query string), (5) ``ua:<UA>|ip:<IP>`` as a last resort.
+        """
+        lowered = {k.lower(): v for k, v in headers.items()}
+        user_agent = lowered.get("user-agent", "")
+        provider = self.match(lowered)
+        if provider is not None:
+            value = self.session_id(provider, lowered)
+            if value:
+                return provider.name, value
+        for header in self.generic_headers:
+            value = lowered.get(header)
+            if value:
+                return "unknown", value
+        if body is not None:
+            for dotted in body_fields:
+                value = extract_body_field(body, dotted)
+                if value is not None:
+                    return "unknown", value
+        if query is not None:
+            if provider is not None:
+                for header in provider.session_headers + provider.gated_session_headers:
+                    value = query.get(header)
+                    if value:
+                        return provider.name, value
+            for header in self.generic_headers:
+                value = query.get(header)
+                if value:
+                    return "unknown", value
+        return "unknown", f"ua:{user_agent}|ip:{client_ip}"
+
+
+def extract_body_field(body: bytes, dotted_path: str) -> str | None:
+    """Walks a dotted path (e.g. "metadata.user_id") into a JSON body (S3).
+
+    Returns the value as a string when it is a non-empty string (or a
+    number), else None. Never raises on malformed input.
+    """
+    try:
+        data: Any = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    for part in dotted_path.split("."):
+        if not isinstance(data, dict) or part not in data:
+            return None
+        data = data[part]
+    if isinstance(data, str) and data:
+        return data
+    if isinstance(data, (int, float)) and not isinstance(data, bool):
+        return str(data)
     return None
 
 

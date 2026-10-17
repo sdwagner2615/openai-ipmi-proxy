@@ -19,17 +19,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import Request, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
-from relay.clients import StatusPoller, detect_client, resolve_shared_spot, session_header_value
+from relay.clients import (
+    ClientRegistry,
+    StatusPoller,
+    resolve_shared_spot,
+)
 from relay.power.base import PowerState
 from relay.queue import EndpointQueue, QueueEntry, UnknownTracker
 from relay.store import RequestRecord
@@ -45,107 +48,8 @@ logger = logging.getLogger("relay.endpoints")
 
 __all__ = [
     "EndpointRuntime",
-    "extract_body_field",
-    "resolve_session_id",
     "route",
 ]
-
-
-def extract_body_field(body: bytes, dotted_path: str) -> str | None:
-    """Walks a dotted path (e.g. "metadata.user_id") into a JSON body (S3).
-
-    Returns the value as a string when it is a non-empty string (or a
-    number), else None. Never raises on malformed input.
-    """
-    try:
-        data: Any = json.loads(body)
-    except (ValueError, TypeError):
-        return None
-    for part in dotted_path.split("."):
-        if not isinstance(data, dict) or part not in data:
-            return None
-        data = data[part]
-    if isinstance(data, str) and data:
-        return data
-    if isinstance(data, (int, float)) and not isinstance(data, bool):
-        return str(data)
-    return None
-
-
-def resolve_session_id(
-    request: Request,
-    body: bytes,
-    endpoint: EndpointRuntime,
-    providers: list,
-    generic_headers: list[str],
-) -> tuple[str, str]:
-    """Identifies the session for a request (S1, D22).
-
-    Precedence:
-      1. a white-glove client's own session headers (plain, then UA-gated),
-      2. the configured generic session headers,
-      3. the endpoint's body fields (e.g. OpenAI "user", Anthropic
-         "metadata.user_id"),
-      4. User-Agent + client source IP as a last resort.
-    (WS query params join at step 4 with the Phase-1 WS transport.)
-    """
-    lowered = {k.lower(): v for k, v in request.headers.items()}
-    client_ip = request.client.host if request.client else "unknown"
-    user_agent = lowered.get("user-agent", "")
-
-    provider = detect_client(lowered, providers)
-    if provider is not None:
-        value = session_header_value(provider, lowered)
-        if value:
-            return provider.name, value
-    for header in generic_headers:
-        value = lowered.get(header)
-        if value:
-            return "unknown", value
-    for dotted in endpoint.config.session_id_body_fields:
-        value = extract_body_field(body, dotted)
-        if value is not None:
-            return "unknown", value
-    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
-
-
-def resolve_session_id_ws(
-    websocket: WebSocket,
-    endpoint: EndpointRuntime,
-    providers: list,
-    generic_headers: list[str],
-) -> tuple[str, str]:
-    """Identifies the session for a WebSocket (D22, no body).
-
-    Precedence: (1) a white-glove client's own headers, (2) the configured
-    generic headers, (3) WS query params mirroring the configured header names
-    (white-glove first, then generic) — WS URLs carry ids/tokens in the query
-    string — (4) UA + source IP as a last resort.
-    """
-    lowered = {k.lower(): v for k, v in websocket.headers.items()}
-    user_agent = lowered.get("user-agent", "")
-    client_ip = websocket.client.host if websocket.client else "unknown"
-
-    provider = detect_client(lowered, providers)
-    if provider is not None:
-        value = session_header_value(provider, lowered)
-        if value:
-            return provider.name, value
-    for header in generic_headers:
-        value = lowered.get(header)
-        if value:
-            return "unknown", value
-    query = websocket.query_params
-    if provider is not None:
-        for header in provider.session_headers + provider.gated_session_headers:
-            value = query.get(header)
-            if value:
-                return provider.name, value
-    for header in generic_headers:
-        value = query.get(header)
-        if value:
-            return "unknown", value
-    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
 
 
 def route(path: str, endpoints: dict[str, EndpointRuntime]) -> EndpointRuntime | None:
@@ -172,8 +76,7 @@ class EndpointRuntime:
         http_client: httpx.AsyncClient,
         store: Store,
         pollers: dict[str, StatusPoller],
-        providers: list,
-        generic_headers: list[str],
+        registry: ClientRegistry,
         unknown_tracker: UnknownTracker,
         read_timeout: float = 0,
     ):
@@ -182,8 +85,7 @@ class EndpointRuntime:
         self.http_client = http_client
         self.store = store
         self.pollers = pollers
-        self.providers = providers
-        self.generic_headers = generic_headers
+        self.registry = registry
         self.unknown_tracker = unknown_tracker
         # Live proxy-to-target read timeout (X4); the app refreshes it on
         # every endpoint when the monitor changes it.
@@ -502,8 +404,8 @@ class EndpointRuntime:
 
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
-        client_name, session_id = resolve_session_id(
-            request, body, self, self.providers, self.generic_headers
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, body=body, body_fields=tuple(self.config.session_id_body_fields)
         )
         client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
         return await self._forward(
@@ -523,8 +425,10 @@ class EndpointRuntime:
         ``passthrough``), then tunnels. The inbound connection is always
         closed exactly once on exit.
         """
-        client_name, session_id = resolve_session_id_ws(
-            websocket, self, self.providers, self.generic_headers
+        lowered = {k.lower(): v for k, v in websocket.headers.items()}
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, query=websocket.query_params
         )
         await websocket.accept()
         client_q: asyncio.Queue = asyncio.Queue()
@@ -547,13 +451,12 @@ class EndpointRuntime:
                     await self._close_ws(websocket)
                     return
             if self.config.routing == "queued" and not passthrough:
-                client_ip = websocket.client.host if websocket.client else "unknown"
                 session = self.queue.get_or_create_session(
                     client_name,
                     session_id,
                     self.name,
                     client_ip,
-                    websocket.headers.get("user-agent", ""),
+                    lowered.get("user-agent", ""),
                 )
                 held = await self._hold_ws_spot(
                     websocket, session, disconnected, self.config.queue_timeout or None
@@ -671,8 +574,8 @@ class EndpointRuntime:
 
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
-        client_name, session_id = resolve_session_id(
-            request, body, self, self.providers, self.generic_headers
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, body=body, body_fields=tuple(self.config.session_id_body_fields)
         )
         session = self.queue.get_or_create_session(
             client_name, session_id, self.name, client_ip, lowered.get("user-agent", "")
