@@ -1,4 +1,4 @@
-"""Known-client providers and their status APIs.
+"""White-glove client identification and the status-source interface (D20/D21).
 
 Queuing needs to know when a session is truly done with the model (not just
 "the last HTTP response finished"), because the client may still be inside a
@@ -6,52 +6,23 @@ long tool call and we want to keep its K/V cache warm by holding its spot.
 
 Known clients can therefore report their own session state over an external
 API. White-glove clients are configured (D20/D21): identified by header/UA
-rules, and carrying a `StatusSource` — in this phase the opencode source,
-which must reproduce every current opencode behavior (parity.md
-§client-status).
+rules (``ClientProvider`` / ``ClientRegistry``), and carrying a pluggable
+``StatusSource`` — where to poll (a base URL on the client's own source IP)
+and how to interpret the answers. The opencode source
+(``relay/status_opencode.py``) is the reference implementation and must
+reproduce every current opencode behavior (parity.md §client-status).
 
-OpenCode's local server exposes GET /session/status returning
-    { <sessionID>: {"type": "busy"} | {"type": "retry", "attempt", "message", "next"} }
-"busy" is held for the whole turn, including tool execution, which is
-exactly the window we want to protect. Note that an idle session is NOT
-present in the map at all - opencode deletes its entry the moment the
-session goes idle, so "absent from a fresh status map" is the idle report.
-
-Session identification: opencode only sends the "x-opencode-session" header
-when talking to OpenCode's own hosted provider; for every other provider
-(e.g. a self-hosted llama.cpp server) it sends "X-Session-Id" (and
-"x-session-affinity") instead. Both are checked, gated on the opencode
-User-Agent, so other tools that happen to send an X-Session-Id header are
-not misattributed.
-
-The status map is per-directory (one opencode "instance" per working
-directory), so the session's directory is resolved first via
-GET /session/{id} (which works without a directory and returns it) and the
-status is then polled with GET /session/status?directory=<dir>.
-
-Sub-agents: opencode's task tool creates sub-agent sessions that carry a
-"parentID" pointing at the session that spawned them (also returned by
-GET /session/{id}). The proxy uses this to let a sub-agent share the spot
-of its tracked ancestor instead of waiting for one of its own.
-
-Waiting for user input: while a session is blocked mid-turn on a pending
-permission approval or a question answer, opencode keeps it "busy" in the
-status map, so the proxy also polls the client's pending-request endpoints
-(GET /permission and GET /question, both per-directory like the status
-map) and treats sessions with a pending request as "waiting for input".
-
-Discovery: the proxy probes <client-source-IP>:<port>. The client must
-therefore run its opencode server on a reachable interface (e.g.
-"opencode serve --hostname 0.0.0.0 --port 4096"); the TUI default
-(127.0.0.1, random port) is not reachable from the proxy.
+A configured client without a status source (``status.kind: none``) gets no
+reports at all: its sessions fall back to busy-window inference, like
+unknown clients.
 """
 
 import json
 import logging
+from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 
@@ -63,10 +34,10 @@ __all__ = [
     "STATUS_UNREACHABLE_GRACE",
     "ClientProvider",
     "ClientRegistry",
-    "StatusPoller",
+    "StatusReport",
+    "StatusSource",
     "detect_client",
     "extract_body_field",
-    "providers_from_config",
     "resolve_shared_spot",
     "session_header_value",
 ]
@@ -118,11 +89,6 @@ def provider_from_config(client: ClientConfig) -> ClientProvider:
         children_kind=client.children.kind,
         children_depth=client.children.depth,
     )
-
-
-def providers_from_config(clients: list[ClientConfig]) -> list[ClientProvider]:
-    """The configured white-glove clients, in config order (first match wins)."""
-    return [provider_from_config(client) for client in clients]
 
 
 def detect_client(headers: dict, providers: list[ClientProvider]) -> ClientProvider | None:
@@ -243,137 +209,109 @@ def extract_body_field(body: bytes, dotted_path: str) -> str | None:
     return None
 
 
-class StatusPoller:
-    """
-    Polls one white-glove client's status API. One base URL per client
-    machine (derived from the client's source IP). Because the status map is
-    per-directory, each session's directory is resolved once (GET
-    /session/{id}) and cached; one status GET is then made per distinct
-    directory per poll interval.
+@dataclass(frozen=True)
+class StatusReport:
+    """One session's normalized status as reported by a source."""
+
+    # busy | idle | retry ("waiting" is applied by the caller from the
+    # pending-input poll, not reported in the status map).
+    status: str
+    # Source-specific detail (e.g. the attempt count for a retry).
+    detail: str = ""
+
+
+class StatusSource(ABC):
+    """Pluggable per-client status API (D21).
+
+    One source per configured white-glove client that has a status source.
+    The proxy polls the client's own machine (``base_url(client_ip)`` —
+    e.g. ``http://<client-ip>:4096`` for opencode) at the source's
+    ``poll_interval``, and drives each session's state from the client's
+    own reports instead of from the proxy's HTTP timing.
+
+    Contract:
+
+    - ``fetch_statuses`` returns the sessions the client reports as ACTIVE,
+      normalized. A session missing from a fresh map IS the client's idle
+      report (sources only list non-idle sessions).
+    - A ``None`` return means the client is unreachable or answered with
+      garbage: callers keep the session's last-known status for
+      ``STATUS_UNREACHABLE_GRACE`` and then fall back to idle. A partial
+      answer must never clear a session's state.
+    - A session's context (e.g. opencode's working directory) is resolved
+      once via ``fetch_session_info`` and cached by the source
+      (``resolve_context``); the parent-id cache (``parent_of``) is what
+      the parent-chain child rule walks.
+    - ``last_poll[base]`` is stamped by the caller at poll START (before
+      the fetches) so the interval is measured start-to-start.
     """
 
-    def __init__(
-        self,
-        http_client: httpx.AsyncClient,
-        provider: ClientProvider,
-        port: int,
-        password: str = "",
-        poll_interval: float = 5.0,
-        timeout: float = 2.0,
-    ):
+    def __init__(self, http_client: httpx.AsyncClient, poll_interval: float):
         self.http_client = http_client
-        self.provider = provider
-        self.port = port
         self.poll_interval = poll_interval
-        self.timeout = httpx.Timeout(timeout)
-        # Basic auth: opencode servers protected with a password use the
-        # fixed username "opencode".
-        self.auth = ("opencode", password) if password else None
+        # base (client machine) -> last poll start, stamped by the caller.
         self.last_poll: dict[str, float] = {}
-        # (base, session-id) -> working directory; a session's directory
-        # never changes, so entries live until the session is gone.
-        self.session_dir: dict[tuple, str] = {}
-        # (base, session-id) -> parent session id (None = not a sub-agent).
-        self.session_parent: dict[tuple, str | None] = {}
-
-    def base_url(self, client_ip: str) -> str:
-        return f"http://{client_ip}:{self.port}"
+        # (base, session-id) -> context (e.g. working directory); a session's
+        # context never changes, so entries live until the session is gone.
+        self._context: dict[tuple, str] = {}
+        # (base, session-id) -> parent session id (None = not a child session).
+        self._parent: dict[tuple, str | None] = {}
 
     def due(self, base: str, now: float) -> bool:
         return now - self.last_poll.get(base, 0.0) >= self.poll_interval
 
+    def parent_of(self, base: str, session_id: str) -> str | None:
+        """The cached parent id for a session (None = unknown or no parent)."""
+        return self._parent.get((base, session_id))
+
     def forget(self, base: str, session_id: str) -> None:
-        self.session_dir.pop((base, session_id), None)
-        self.session_parent.pop((base, session_id), None)
+        """Drops the session's context + parent caches."""
+        self._context.pop((base, session_id), None)
+        self._parent.pop((base, session_id), None)
 
-    async def fetch_session_info(self, base: str, session_id: str) -> tuple | None:
+    def forget_gone(self, base: str, live: set[str]) -> None:
+        """Drops the caches of this base's sessions that have vanished."""
+        for key in [k for k in self._context if k[0] == base and k[1] not in live]:
+            self.forget(key[0], key[1])
+
+    async def resolve_context(self, base: str, session_id: str) -> tuple[str, str | None] | None:
+        """The session's (context, parent-id), cached after the first fetch.
+
+        Returns None when the session is unknown or the client is
+        unreachable (callers skip that session until the next poll).
         """
-        Resolves a session's (working directory, parent session id) via
-        GET /session/{id}. The parent id is None for regular sessions and
-        set for sub-agent sessions (opencode's task tool). Returns None
-        when the session is unknown or the client is unreachable (callers
-        skip that session until the next poll).
-        """
-        url = f"{base}{self.provider.session_path}/{quote(session_id, safe='')}"
-        try:
-            response = await self.http_client.get(url, timeout=self.timeout, auth=self.auth)
-            if response.status_code != 200:
-                logger.debug("Session lookup %s: HTTP %s", url, response.status_code)
-                return None
-            data = response.json()
-            if (
-                not isinstance(data, dict)
-                or not isinstance(data.get("directory"), str)
-                or not data["directory"]
-            ):
-                return None
-            parent = data.get("parentID")
-            return data["directory"], (parent if isinstance(parent, str) and parent else None)
-        except Exception as e:
-            logger.debug("Session lookup %s failed: %s", url, e)
+        key = (base, session_id)
+        if key in self._context:
+            return self._context[key], self._parent.get(key)
+        info = await self.fetch_session_info(base, session_id)
+        if info is None:
             return None
+        context, parent_id = info
+        self._context[key] = context
+        self._parent[key] = parent_id
+        return context, parent_id
 
-    async def fetch_statuses(self, base: str, directory: str | None) -> dict | None:
-        """
-        GETs the status map for one client base and directory. Returns a
-        dict of session-id -> status-object, or None when the client is
-        unreachable or answers with garbage (callers keep last-known state
-        in that case). The caller stamps last_poll[base] at poll start
-        (before the fetches) so the interval is measured start-to-start.
-        """
-        url = base + self.provider.status_path
-        params = {"directory": directory} if directory else None
-        try:
-            response = await self.http_client.get(
-                url, params=params, timeout=self.timeout, auth=self.auth
-            )
-            if response.status_code != 200:
-                logger.debug("Status poll %s: HTTP %s", url, response.status_code)
-                return None
-            data = response.json()
-            if not isinstance(data, dict):
-                return None
-            return data
-        except Exception as e:
-            logger.debug("Status poll %s failed: %s", url, e)
-            return None
+    @abstractmethod
+    def base_url(self, client_ip: str) -> str:
+        """The status-API base for one client machine (its source IP)."""
 
-    async def fetch_pending(self, base: str, directory: str | None) -> dict | None:
-        """
-        GETs the pending user-input endpoints (permission / question) for
-        one client base and directory. Returns {session-id: kind} for the
-        sessions currently blocked awaiting a human, or None when any of
-        the endpoints is unreachable or answers with garbage (callers keep
-        last-known state; a partial answer must never clear a session's
-        "waiting" flag).
-        """
-        params = {"directory": directory} if directory else None
-        pending: dict = {}
-        for path, kind in self.provider.pending_paths:
-            url = base + path
-            try:
-                response = await self.http_client.get(
-                    url, params=params, timeout=self.timeout, auth=self.auth
-                )
-                if response.status_code != 200:
-                    logger.debug("Pending poll %s: HTTP %s", url, response.status_code)
-                    return None
-                data = response.json()
-                if not isinstance(data, list):
-                    return None
-                for item in data:
-                    if isinstance(item, dict) and isinstance(item.get("sessionID"), str):
-                        pending[item["sessionID"]] = kind
-            except Exception as e:
-                logger.debug("Pending poll %s failed: %s", url, e)
-                return None
-        return pending
+    @abstractmethod
+    async def fetch_session_info(self, base: str, session_id: str) -> tuple[str, str | None] | None:
+        """Resolves a session's (context, parent-id); None = unknown/unreachable."""
+
+    @abstractmethod
+    async def fetch_statuses(self, base: str, context: str) -> dict[str, StatusReport] | None:
+        """The client's active-session status map for one context; None = unreachable."""
+
+    @abstractmethod
+    async def fetch_pending(self, base: str, context: str) -> dict[str, str] | None:
+        """{session-id: kind} for sessions blocked awaiting user input; None = unreachable."""
 
 
 def resolve_shared_spot(
     base: str,
     session_id: str,
-    poller: StatusPoller,
+    source: StatusSource,
     sessions: dict,
     spots: dict,
     client_name: str,
@@ -386,18 +324,15 @@ def resolve_shared_spot(
     proxy). If that ancestor is itself a sub-agent, the spot it shares is
     returned instead. None means no sharing: the session needs a spot of
     its own. Recomputed on every poll; no network I/O (the cache is filled
-    by the status poller). `sessions`/`spots` are the owning endpoint
+    by the status source). `sessions`/`spots` are the owning endpoint
     queue's dicts (passed explicitly to avoid a circular import).
     """
     current = session_id
     seen = {current}
     for _ in range(depth):  # depth cap; real sub-agent chains are 1-2 levels
-        key = (base, current)
-        if key not in poller.session_parent:
-            return None  # chain not resolved yet; retried next poll
-        parent = poller.session_parent[key]
+        parent = source.parent_of(base, current)
         if not parent or parent in seen:
-            return None
+            return None  # not a child, a cycle, or the chain is unresolved yet
         seen.add(parent)
         ancestor = sessions.get((client_name, parent))
         if ancestor is not None:

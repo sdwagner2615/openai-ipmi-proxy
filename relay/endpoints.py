@@ -28,11 +28,7 @@ from fastapi import Request, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
-from relay.clients import (
-    ClientRegistry,
-    StatusPoller,
-    resolve_shared_spot,
-)
+from relay.clients import ClientRegistry, StatusSource, resolve_shared_spot
 from relay.power.base import PowerState
 from relay.queue import EndpointQueue, QueueEntry, UnknownTracker
 from relay.store import RequestRecord
@@ -75,7 +71,7 @@ class EndpointRuntime:
         *,
         http_client: httpx.AsyncClient,
         store: Store,
-        pollers: dict[str, StatusPoller],
+        sources: dict[str, StatusSource],
         registry: ClientRegistry,
         unknown_tracker: UnknownTracker,
         read_timeout: float = 0,
@@ -84,7 +80,7 @@ class EndpointRuntime:
         self.server = server
         self.http_client = http_client
         self.store = store
-        self.pollers = pollers
+        self.sources = sources
         self.registry = registry
         self.unknown_tracker = unknown_tracker
         # Live proxy-to-target read timeout (X4); the app refreshes it on
@@ -199,97 +195,85 @@ class EndpointRuntime:
         # 1) Client status polling (grouped per client machine).
         bases: dict[tuple, list] = {}
         for session in self.queue.sessions.values():
-            if session.client == "unknown":
+            source = self.sources.get(session.client)
+            if source is None:
+                # "unknown" and kind:none clients have no status source.
                 continue
-            poller = self.pollers.get(session.client)
-            if poller is None:
-                continue
-            base = poller.base_url(session.client_ip)
-            bases.setdefault((poller, base), []).append(session)
-        for (poller, base), sessions in bases.items():
-            if not poller.due(base, now):
+            base = source.base_url(session.client_ip)
+            bases.setdefault((source, base), []).append(session)
+        for (source, base), sessions in bases.items():
+            if not source.due(base, now):
                 continue
             # Stamp the interval at poll start, not completion: stamping after
             # the fetches makes the gap between polls tick period + sleep
             # overshoot - fetch duration, which dips below poll_interval and
             # silently skips every other tick (2s cadence instead of 1s).
-            poller.last_poll[base] = time.monotonic()
-            # The status map is per-directory (one opencode "instance" per
-            # working directory), so first resolve each session's directory
-            # (GET /session/{id}, cached) and then poll one map per
-            # directory. Unreachable lookups are skipped; tick() keeps each
-            # session's last-known status for the grace period.
-            by_dir: dict[str, list] = {}
+            source.last_poll[base] = time.monotonic()
+            # A session's context (e.g. opencode's working directory) is
+            # resolved once (cached in the source), then one status map is
+            # polled per context. Unreachable lookups are skipped; tick()
+            # keeps each session's last-known status for the grace period.
+            by_context: dict[str, list] = {}
             for session in sessions:
-                key = (base, session.session_id)
-                directory = poller.session_dir.get(key)
-                if directory is None:
-                    info = await poller.fetch_session_info(base, session.session_id)
-                    if info is None:
-                        continue
-                    directory, parent_id = info
-                    poller.session_dir[key] = directory
-                    poller.session_parent[key] = parent_id
-                by_dir.setdefault(directory, []).append(session)
+                resolved = await source.resolve_context(base, session.session_id)
+                if resolved is None:
+                    continue
+                context, _parent_id = resolved
+                by_context.setdefault(context, []).append(session)
                 # Sub-agent slot sharing (Q8): a session runs on the spot of
                 # its tracked ancestor, recomputed every poll.
-                if poller.provider.children_kind == "parent-chain":
+                provider = self.registry.by_name.get(session.client)
+                if provider is not None and provider.children_kind == "parent-chain":
                     session.shared_spot_key = resolve_shared_spot(
                         base,
                         session.session_id,
-                        poller,
+                        source,
                         self.queue.sessions,
                         self.queue.spots,
                         session.client,
-                        poller.provider.children_depth,
+                        provider.children_depth,
                     )
                 else:
                     session.shared_spot_key = None
-            for directory, dir_sessions in by_dir.items():
-                data = await poller.fetch_statuses(base, directory)
-                # Sessions blocked on a pending permission or question stay
-                # "busy" in the status map, so the pending-request endpoints
-                # are the tie-breaker (C3). A failed poll (None) keeps the
+            for context, ctx_sessions in by_context.items():
+                statuses = await source.fetch_statuses(base, context)
+                # Sessions blocked on a pending user-input request stay
+                # "busy" in the status map, so the pending endpoints are the
+                # tie-breaker (C3). A failed poll (None) keeps the
                 # last-known state.
-                pending = await poller.fetch_pending(base, directory)
-                if data is not None or pending is not None:
-                    reported = time.monotonic()
-                    for session in dir_sessions:
-                        reason = pending.get(session.session_id) if pending is not None else None
-                        if reason is not None:
-                            if session.client_status != "waiting":
-                                logger.info(
-                                    "Session %s (%s) waiting for user input: %s.",
-                                    session.session_id,
-                                    session.client,
-                                    reason,
-                                )
-                            session.client_status = "waiting"
-                            session.client_status_detail = reason
-                            session.client_status_at = reported
-                            continue
-                        if data is None:
-                            continue
-                        st = data.get(session.session_id)
-                        if not isinstance(st, dict):
-                            # A fresh map that lacks this session IS the
-                            # client's idle report (C2).
-                            session.client_status = "idle"
-                            session.client_status_detail = "absent from status map (idle)"
-                            session.client_status_at = reported
-                            continue
-                        stype = st.get("type")
-                        if stype not in ("busy", "idle", "retry"):
-                            continue
-                        session.client_status = stype
+                pending = await source.fetch_pending(base, context)
+                if statuses is None and pending is None:
+                    continue  # unreachable: last-known status is kept
+                reported = time.monotonic()
+                for session in ctx_sessions:
+                    reason = pending.get(session.session_id) if pending is not None else None
+                    if reason is not None:
+                        if session.client_status != "waiting":
+                            logger.info(
+                                "Session %s (%s) waiting for user input: %s.",
+                                session.session_id,
+                                session.client,
+                                reason,
+                            )
+                        session.client_status = "waiting"
+                        session.client_status_detail = reason
                         session.client_status_at = reported
-                        session.client_status_detail = (
-                            f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
-                        )
-            # Forget directory cache entries of sessions that are gone.
-            live = {s.session_id for s in sessions}
-            for key in [k for k in poller.session_dir if k[0] == base and k[1] not in live]:
-                poller.forget(key[0], key[1])
+                        continue
+                    if statuses is None:
+                        continue
+                    report = statuses.get(session.session_id)
+                    if report is None:
+                        # A fresh map that lacks this session IS the
+                        # client's idle report (C2).
+                        session.client_status = "idle"
+                        session.client_status_detail = "absent from status map (idle)"
+                        session.client_status_at = reported
+                        continue
+                    session.client_status = report.status
+                    session.client_status_detail = report.detail
+                    session.client_status_at = reported
+            # Forget context/parent caches of sessions that are gone.
+            source.forget_gone(base, {s.session_id for s in sessions})
 
         # 2) Status recompute + spot surrender.
         for key, reason in self.queue.tick(now):
