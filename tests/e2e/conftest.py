@@ -992,6 +992,228 @@ def multi_env(tmp_path_factory):
         _stop(proc)
 
 
+# Opencode-parity config (Phase 3, D20/D21): one redfish server (mock BMC,
+# on) with a queued (wait) endpoint, and THREE client entries: `opencode`
+# (status mock A, parent-chain children), `opencode-b` (status mock B — the
+# /offline switch drives the unreachable-grace test), and `mytool`
+# (status.kind: none — busy-window inference only).
+OC_CONFIG = """\
+proxy:
+  host: 127.0.0.1
+  port: {port}
+  unknown_path_policy: allow
+  target_read_timeout: 0
+  store:
+    path: {db}
+
+servers:
+  - name: testbox
+    type: redfish
+    power:
+      host: 127.0.0.1
+      user: test
+      password: test
+      base_url: http://127.0.0.1:{bmc_port}
+      system_path: /redfish/v1/Systems/Self
+      verify_ssl: false
+    service_url: http://127.0.0.1:{target_port}
+    idle_timeout: 3600
+    shutdown_enabled: false
+    adopt_on_traffic: true
+
+endpoints:
+  - name: openai
+    server: testbox
+    path_prefix: /v1
+    catch_all: true
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: wait
+    routing: queued
+    concurrency: {concurrency}
+    session:
+      per_session_requests: -1
+      request_mode: parallel
+      busy_window: {busy_window}
+      expiry: {expiry}
+      immediate_idle_release: {immediate}
+
+clients:
+  - name: opencode
+    match:
+      ua_prefix: opencode/
+      session_headers:
+        - x-opencode-session
+      gated_session_headers:
+        - x-session-affinity
+        - x-session-id
+    status:
+      kind: opencode
+      port: {status_port}
+      poll_interval: {poll_interval}
+    children:
+      kind: parent-chain
+      depth: 10
+  - name: opencode-b
+    match:
+      session_headers:
+        - x-opencode-b-session
+    status:
+      kind: opencode
+      port: {status_b_port}
+      poll_interval: {poll_interval}
+  - name: mytool
+    match:
+      session_headers:
+        - x-mytool-session
+    status:
+      kind: none
+"""
+
+
+@pytest.fixture(scope="session")
+def oc_env(tmp_path_factory):
+    """Fresh mock target + BMC + two opencode status mocks + proxy per scenario.
+
+    Each ``make()`` call is fully isolated (own target, BMC, and both status
+    mocks), so per-mock request counters, the /offline switch, and the
+    per-directory maps start clean. The three client entries (opencode,
+    opencode-b, mytool/kind:none) are all present in every scenario.
+    """
+    root = tmp_path_factory.mktemp("e2e-opencode")
+    logdir = root / "logs"
+    logdir.mkdir()
+    processes: list[subprocess.Popen] = []
+    counter = {"n": 0}
+
+    async def make(
+        name,
+        *,
+        busy_window: float = 2,
+        expiry: float = 4,
+        immediate: bool = True,
+        poll_interval: float = 1,
+        concurrency: int = 1,
+        delay: float = 0.0,
+    ) -> SimpleNamespace:
+        counter["n"] += 1
+        n = counter["n"]
+        bmc_port = free_port()
+        port = free_port()
+        target_port = free_port()
+        status_port = free_port()
+        status_b_port = free_port()
+        bmc = _spawn(
+            f"bmc-oc-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_bmc.py")],
+            root,
+            logdir,
+            {"MOCK_BMC_PORT": str(bmc_port), "MOCK_BMC_INITIAL": "on"},
+        )
+        processes.append(bmc)
+        await wait_http(f"http://127.0.0.1:{bmc_port}/redfish/v1/Systems/Self")
+        # delay: mock-target response delay, so a request stays in-flight
+        # across at least one status-poll tick (the waiting-state window).
+        target = _spawn(
+            f"target-oc-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_target.py")],
+            root,
+            logdir,
+            {"MOCK_TARGET_PORT": str(target_port), "MOCK_DELAY": str(delay)},
+        )
+        processes.append(target)
+        await wait_http(f"http://127.0.0.1:{target_port}/health")
+        mock = _spawn(
+            f"mock-opencode-oc-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_opencode.py")],
+            root,
+            logdir,
+            {"MOCK_STATUS_PORT": str(status_port)},
+        )
+        processes.append(mock)
+        await wait_http(f"http://127.0.0.1:{status_port}/session/status")
+        mock_b = _spawn(
+            f"mock-opencode-b-oc-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_opencode.py")],
+            root,
+            logdir,
+            {"MOCK_STATUS_PORT": str(status_b_port)},
+        )
+        processes.append(mock_b)
+        await wait_http(f"http://127.0.0.1:{status_b_port}/session/status")
+        cfg_dir = root / f"oc{n}"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "port": port,
+            "bmc_port": bmc_port,
+            "target_port": target_port,
+            "status_port": status_port,
+            "status_b_port": status_b_port,
+            "busy_window": busy_window,
+            "expiry": expiry,
+            "immediate": "true" if immediate else "false",
+            "poll_interval": poll_interval,
+            "concurrency": concurrency,
+            "db": str(cfg_dir / "relay.db"),
+        }
+        cfg = cfg_dir / "config.yaml"
+        cfg.write_text(OC_CONFIG.format(**values))
+        proxy = _spawn(
+            f"proxy-oc-{n}",
+            [sys.executable, "-m", "relay", "--config", str(cfg)],
+            cfg_dir,
+            logdir,
+        )
+        processes.append(proxy)
+        await wait_http(f"http://127.0.0.1:{port}/healthz")
+
+        async def monitor() -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/monitor/data", timeout=5)
+                response.raise_for_status()
+                return response.json()
+
+        async def mock_requests(m_port: int) -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{m_port}/requests", timeout=5)
+                return response.json()
+
+        async def mock_offline(m_port: int, offline: bool) -> None:
+            async with httpx.AsyncClient() as client:
+                if offline:
+                    await client.post(f"http://127.0.0.1:{m_port}/offline", timeout=5)
+                else:
+                    await client.delete(f"http://127.0.0.1:{m_port}/offline", timeout=5)
+
+        def stop() -> None:
+            _stop(proxy)
+            _stop(mock_b)
+            _stop(mock)
+            _stop(target)
+            _stop(bmc)
+
+        return SimpleNamespace(
+            name=name,
+            n=n,
+            port=port,
+            bmc_port=bmc_port,
+            status_port=status_port,
+            status_b_port=status_b_port,
+            dir=cfg_dir,
+            db=values["db"],
+            monitor=monitor,
+            mock_requests=mock_requests,
+            mock_offline=mock_offline,
+            stop=stop,
+        )
+
+    yield SimpleNamespace(root=root, make=make)
+    for proc in processes:
+        _stop(proc)
+
+
 # EC2-boot-latency config (Phase 2, D10): one aws-ec2 server whose power
 # block points a REAL boto3 client at the fake EC2 API (endpoint_url), plus
 # one queued (wait) endpoint. The instance id matches the fake's default.
