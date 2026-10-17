@@ -990,3 +990,165 @@ def multi_env(tmp_path_factory):
     yield SimpleNamespace(root=root, make=make)
     for proc in processes:
         _stop(proc)
+
+
+# EC2-boot-latency config (Phase 2, D10): one aws-ec2 server whose power
+# block points a REAL boto3 client at the fake EC2 API (endpoint_url), plus
+# one queued (wait) endpoint. The instance id matches the fake's default.
+EC2_CONFIG = """\
+proxy:
+  host: 127.0.0.1
+  port: {port}
+  unknown_path_policy: allow
+  target_read_timeout: 0
+  store:
+    path: {db}
+
+servers:
+  - name: ec2box
+    type: aws-ec2
+    power:
+      region: us-east-1
+      instance_id: i-fake
+      access_key: test
+      secret_key: test
+      endpoint_url: http://127.0.0.1:{ec2_port}
+      off_action: stop
+    service_url: http://127.0.0.1:{target_port}
+    idle_timeout: 3600
+    shutdown_enabled: true
+    adopt_on_traffic: true
+
+endpoints:
+  - name: ec2-api
+    server: ec2box
+    path_prefix: /e
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: wait
+    routing: queued
+    concurrency: 1
+    session:
+      busy_window: 1
+      expiry: 1
+      immediate_idle_release: true
+"""
+
+
+@pytest.fixture(scope="session")
+def ec2_env(tmp_path_factory):
+    """Fake EC2 API (stopped instance) + startable target + one-server proxy.
+
+    The instance starts ``stopped``; the proxy's real boto3 client talks to
+    the fake via the power block's ``endpoint_url``. ``start_instances``
+    moves it ``pending`` and then ``running`` after the boot delay,
+    independently of the (down) target — so the endpoint only becomes ready
+    once the test starts the target (the wait-and-poll path with a slow
+    boot).
+    """
+    root = tmp_path_factory.mktemp("e2e-ec2")
+    logdir = root / "logs"
+    logdir.mkdir()
+    processes: list[subprocess.Popen] = []
+    counter = {"n": 0}
+
+    async def make(name, *, boot_delay: float = 2.0, target_up: bool = False) -> SimpleNamespace:
+        counter["n"] += 1
+        n = counter["n"]
+        ec2_port = free_port()
+        port = free_port()
+        target_port = free_port()
+        ec2 = _spawn(
+            f"fake-ec2-{n}",
+            [sys.executable, str(REPO / "tests/mocks/fake_ec2.py")],
+            root,
+            logdir,
+            {
+                "FAKE_EC2_PORT": str(ec2_port),
+                "FAKE_EC2_INITIAL": "stopped",
+                "FAKE_EC2_BOOT_DELAY": str(boot_delay),
+            },
+        )
+        processes.append(ec2)
+        await wait_http(f"http://127.0.0.1:{ec2_port}/state")
+        cfg_dir = root / f"ec2{n}"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "port": port,
+            "ec2_port": ec2_port,
+            "target_port": target_port,
+            "db": str(cfg_dir / "relay.db"),
+        }
+        cfg = cfg_dir / "config.yaml"
+        cfg.write_text(EC2_CONFIG.format(**values))
+        proxy = _spawn(
+            f"proxy-ec2-{n}",
+            [sys.executable, "-m", "relay", "--config", str(cfg)],
+            cfg_dir,
+            logdir,
+        )
+        processes.append(proxy)
+        await wait_http(f"http://127.0.0.1:{port}/healthz")
+
+        state = {"target": None}
+
+        async def start_target() -> None:
+            if state["target"] is not None:
+                return
+            proc = _spawn(
+                f"ec2-target-{n}",
+                [sys.executable, str(REPO / "tests/mocks/mock_target.py")],
+                root,
+                logdir,
+                {"MOCK_TARGET_PORT": str(target_port), "MOCK_DELAY": "0"},
+            )
+            processes.append(proc)
+            state["target"] = proc
+            await wait_http(f"http://127.0.0.1:{target_port}/health")
+
+        async def ec2_state() -> str:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{ec2_port}/state", timeout=5)
+                return response.json()["state"]
+
+        async def ec2_actions() -> list:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{ec2_port}/actions", timeout=5)
+                return response.json()["actions"]
+
+        async def monitor() -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/monitor/data", timeout=5)
+                response.raise_for_status()
+                return response.json()
+
+        def stop() -> None:
+            if state["target"] is not None:
+                _stop(state["target"])
+                state["target"] = None
+            _stop(proxy)
+            _stop(ec2)
+
+        if target_up:
+            await start_target()
+
+        return SimpleNamespace(
+            name=name,
+            n=n,
+            port=port,
+            ec2_port=ec2_port,
+            target_port=target_port,
+            dir=cfg_dir,
+            db=values["db"],
+            monitor=monitor,
+            ec2_state=ec2_state,
+            ec2_actions=ec2_actions,
+            start_target=start_target,
+            stop=stop,
+        )
+
+    yield SimpleNamespace(root=root, make=make)
+    for proc in processes:
+        _stop(proc)
