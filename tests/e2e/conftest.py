@@ -473,3 +473,520 @@ def adopt_env(tmp_path_factory, env):
     yield ns
     _stop(bmc)
     _stop(proxy)
+
+
+# Shutdown-test config: a single redfish server with a short idle timeout and a
+# short shutdown tick so the 60s engine can be driven in seconds. ``schedule``
+# is null by default (no cron) and injected with quotes when a cron is set.
+SHUTDOWN_CONFIG = """\
+proxy:
+  host: 127.0.0.1
+  port: {port}
+  unknown_path_policy: allow
+  target_read_timeout: 0
+  shutdown_tick: {shutdown_tick}
+  store:
+    path: {db}
+
+servers:
+  - name: testbox
+    type: redfish
+    power:
+      host: 127.0.0.1
+      user: test
+      password: test
+      base_url: http://127.0.0.1:{bmc_port}
+      system_path: /redfish/v1/Systems/Self
+      verify_ssl: false
+    service_url: http://127.0.0.1:{target_port}
+    idle_timeout: {idle_timeout}
+    shutdown_enabled: {shutdown_enabled}
+    adopt_on_traffic: true
+    schedule: {schedule}
+
+endpoints:
+  - name: openai
+    server: testbox
+    path_prefix: /v1
+    catch_all: true
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: wait
+    routing: queued
+    concurrency: 1
+    session_id_body_fields:
+      - user
+    session:
+      per_session_requests: -1
+      request_mode: parallel
+      busy_window: 1
+      expiry: 1
+      immediate_idle_release: true
+"""
+
+
+@pytest.fixture(scope="session")
+def shutdown_env(tmp_path_factory, env):
+    """Fresh BMC + short-cadence proxy per scenario (shutdown / cron / restart).
+
+    Each ``make()`` call spawns an isolated mock BMC (initially on) and a proxy
+    wired to it, reusing the shared mock target/status from ``env``. This keeps
+    power-action accounting per-test (a fresh BMC counts exactly its own actions).
+    """
+    root = tmp_path_factory.mktemp("e2e-shutdown")
+    logdir = root / "logs"
+    logdir.mkdir()
+    processes: list[subprocess.Popen] = []
+    counter = {"n": 0}
+
+    async def make(
+        name: str,
+        *,
+        idle_timeout: float = 3,
+        shutdown_tick: float = 1,
+        shutdown_enabled: bool = True,
+        schedule: str | None = None,
+        db: str | None = None,
+    ) -> SimpleNamespace:
+        counter["n"] += 1
+        n = counter["n"]
+        bmc_port = free_port()
+        port = free_port()
+        bmc = _spawn(
+            f"bmc-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_bmc.py")],
+            root,
+            logdir,
+            {"MOCK_BMC_PORT": str(bmc_port), "MOCK_BMC_INITIAL": "on"},
+        )
+        processes.append(bmc)
+        await wait_http(f"http://127.0.0.1:{bmc_port}/redfish/v1/Systems/Self")
+        cfg_dir = root / f"p{n}"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "port": port,
+            "bmc_port": bmc_port,
+            "target_port": env.target_port,
+            "idle_timeout": idle_timeout,
+            "shutdown_tick": shutdown_tick,
+            "shutdown_enabled": "true" if shutdown_enabled else "false",
+            "schedule": f'"{schedule}"' if schedule else "null",
+            "db": db or str(cfg_dir / "relay.db"),
+        }
+        cfg = cfg_dir / "config.yaml"
+        cfg.write_text(SHUTDOWN_CONFIG.format(**values))
+        proxy = _spawn(
+            f"proxy-{n}",
+            [sys.executable, "-m", "relay", "--config", str(cfg)],
+            cfg_dir,
+            logdir,
+        )
+        processes.append(proxy)
+        await wait_http(f"http://127.0.0.1:{port}/healthz")
+
+        async def monitor() -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/monitor/data", timeout=5)
+                response.raise_for_status()
+                return response.json()
+
+        async def bmc_actions() -> list:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{bmc_port}/actions", timeout=5)
+                return response.json()["actions"]
+
+        def stop() -> None:
+            _stop(proxy)
+            _stop(bmc)
+
+        return SimpleNamespace(
+            name=name,
+            n=n,
+            port=port,
+            bmc_port=bmc_port,
+            dir=cfg_dir,
+            db=values["db"],
+            monitor=monitor,
+            bmc_actions=bmc_actions,
+            stop=stop,
+        )
+
+    yield SimpleNamespace(root=root, make=make, target_port=env.target_port)
+    for proc in processes:
+        _stop(proc)
+
+
+# WS-test config: a redfish server whose service_url is the mock WS target, with
+# a queued (wait) endpoint at /ws and an error-policy (concurrent) one at /wserr.
+WS_CONFIG = """\
+proxy:
+  host: 127.0.0.1
+  port: {port}
+  unknown_path_policy: allow
+  target_read_timeout: 0
+  store:
+    path: {db}
+
+servers:
+  - name: wstbox
+    type: redfish
+    power:
+      host: 127.0.0.1
+      user: test
+      password: test
+      base_url: http://127.0.0.1:{bmc_port}
+      system_path: /redfish/v1/Systems/Self
+      verify_ssl: false
+    service_url: http://127.0.0.1:{target_port}
+    idle_timeout: 3600
+    shutdown_enabled: false
+    adopt_on_traffic: true
+
+endpoints:
+  - name: ws
+    server: wstbox
+    path_prefix: /ws
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: {wait_policy}
+    routing: queued
+    concurrency: {concurrency}
+    session:
+      busy_window: 1
+      expiry: 1
+      immediate_idle_release: true
+  - name: wserr
+    server: wstbox
+    path_prefix: /wserr
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: error
+    routing: concurrent
+"""
+
+
+@pytest.fixture(scope="session")
+def ws_env(tmp_path_factory):
+    """Fresh mock WS target + BMC + proxy per scenario (D18 tunnel tests).
+
+    The WS target is startable/stoppable so tests can drive the readiness gate
+    (keep-alive while waiting, 1013 on the error policy).
+    """
+    root = tmp_path_factory.mktemp("e2e-ws")
+    logdir = root / "logs"
+    logdir.mkdir()
+    processes: list[subprocess.Popen] = []
+    counter = {"n": 0}
+
+    async def make(
+        name: str, *, wait_policy: str = "wait", concurrency: int = 1, target_up: bool = True
+    ) -> SimpleNamespace:
+        counter["n"] += 1
+        n = counter["n"]
+        bmc_port = free_port()
+        port = free_port()
+        target_port = free_port()
+        bmc = _spawn(
+            f"bmc-ws-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_bmc.py")],
+            root,
+            logdir,
+            {"MOCK_BMC_PORT": str(bmc_port), "MOCK_BMC_INITIAL": "on"},
+        )
+        processes.append(bmc)
+        await wait_http(f"http://127.0.0.1:{bmc_port}/redfish/v1/Systems/Self")
+        cfg_dir = root / f"ws{n}"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "port": port,
+            "bmc_port": bmc_port,
+            "target_port": target_port,
+            "wait_policy": wait_policy,
+            "concurrency": concurrency,
+            "db": str(cfg_dir / "relay.db"),
+        }
+        cfg = cfg_dir / "config.yaml"
+        cfg.write_text(WS_CONFIG.format(**values))
+        proxy = _spawn(
+            f"proxy-ws-{n}",
+            [sys.executable, "-m", "relay", "--config", str(cfg)],
+            cfg_dir,
+            logdir,
+        )
+        processes.append(proxy)
+        await wait_http(f"http://127.0.0.1:{port}/healthz")
+
+        state = {"target": None}
+
+        async def start_target() -> None:
+            if state["target"] is not None:
+                return
+            proc = _spawn(
+                f"ws-target-{n}",
+                [sys.executable, str(REPO / "tests/mocks/mock_ws_target.py")],
+                root,
+                logdir,
+                {"MOCK_WS_PORT": str(target_port), "MOCK_WS_DELAY": "0"},
+            )
+            processes.append(proc)
+            state["target"] = proc
+            await wait_http(f"http://127.0.0.1:{target_port}/health")
+
+        def stop_target() -> None:
+            if state["target"] is not None:
+                _stop(state["target"])
+                state["target"] = None
+
+        async def monitor() -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/monitor/data", timeout=5)
+                response.raise_for_status()
+                return response.json()
+
+        def stop() -> None:
+            _stop(proxy)
+            _stop(bmc)
+            stop_target()
+
+        if target_up:
+            await start_target()
+
+        return SimpleNamespace(
+            name=name,
+            port=port,
+            target_port=target_port,
+            dir=cfg_dir,
+            monitor=monitor,
+            start_target=start_target,
+            stop_target=stop_target,
+            stop=stop,
+        )
+
+    yield SimpleNamespace(root=root, make=make)
+    for proc in processes:
+        _stop(proc)
+
+
+# Multi-server config: alpha (redfish, a real mock BMC) + beta (noop, in
+# process), each with its own endpoint (isolated queue) and its own target.
+# Session windows are short (1s) so a held spot is surrendered quickly and the
+# idle-off engine can be driven in seconds.
+MULTI_CONFIG = """\
+proxy:
+  host: 127.0.0.1
+  port: {port}
+  unknown_path_policy: block
+  target_read_timeout: 0
+  shutdown_tick: {shutdown_tick}
+  store:
+    path: {db}
+
+servers:
+  - name: alpha
+    type: redfish
+    power:
+      host: 127.0.0.1
+      user: test
+      password: test
+      base_url: http://127.0.0.1:{bmc_port}
+      system_path: /redfish/v1/Systems/Self
+      verify_ssl: false
+    service_url: http://127.0.0.1:{target_a_port}
+    idle_timeout: {idle_a}
+    shutdown_enabled: true
+    adopt_on_traffic: true
+  - name: beta
+    type: noop
+    power:
+      initial_state: "on"
+    service_url: http://127.0.0.1:{target_b_port}
+    idle_timeout: {idle_b}
+    shutdown_enabled: true
+    adopt_on_traffic: true
+
+endpoints:
+  - name: alpha-api
+    server: alpha
+    path_prefix: /v1
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: {wait_policy}
+    routing: queued
+    concurrency: 1
+    session:
+      busy_window: 1
+      expiry: 1
+      immediate_idle_release: true
+  - name: beta-api
+    server: beta
+    path_prefix: /b
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: {wait_policy}
+    routing: queued
+    concurrency: 1
+    session:
+      busy_window: 1
+      expiry: 1
+      immediate_idle_release: true
+"""
+
+
+@pytest.fixture(scope="session")
+def multi_env(tmp_path_factory):
+    """Fresh mock BMC + two startable targets + a two-server proxy per scenario.
+
+    Server alpha is redfish (its mock BMC records power actions); server beta
+    is noop (in-process). Each has its own endpoint (isolated queue) and target,
+    so routing, per-server readiness, queue isolation, and independent
+    shutdowns can be proven on a single proxy.
+    """
+    root = tmp_path_factory.mktemp("e2e-multi")
+    logdir = root / "logs"
+    logdir.mkdir()
+    processes: list[subprocess.Popen] = []
+    counter = {"n": 0}
+
+    async def make(
+        name,
+        *,
+        idle_a: float = 3.0,
+        idle_b: float = 3600.0,
+        shutdown_tick: float = 1.0,
+        wait_policy: str = "wait",
+        target_a_up: bool = True,
+        target_b_up: bool = True,
+        delay_a: float = 0.0,
+        delay_b: float = 0.0,
+    ) -> SimpleNamespace:
+        counter["n"] += 1
+        n = counter["n"]
+        bmc_port = free_port()
+        port = free_port()
+        target_a_port = free_port()
+        target_b_port = free_port()
+        bmc = _spawn(
+            f"bmc-multi-{n}",
+            [sys.executable, str(REPO / "tests/mocks/mock_bmc.py")],
+            root,
+            logdir,
+            {"MOCK_BMC_PORT": str(bmc_port), "MOCK_BMC_INITIAL": "on"},
+        )
+        processes.append(bmc)
+        await wait_http(f"http://127.0.0.1:{bmc_port}/redfish/v1/Systems/Self")
+        cfg_dir = root / f"m{n}"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "port": port,
+            "bmc_port": bmc_port,
+            "target_a_port": target_a_port,
+            "target_b_port": target_b_port,
+            "idle_a": idle_a,
+            "idle_b": idle_b,
+            "shutdown_tick": shutdown_tick,
+            "wait_policy": wait_policy,
+            "db": str(cfg_dir / "relay.db"),
+        }
+        cfg = cfg_dir / "config.yaml"
+        cfg.write_text(MULTI_CONFIG.format(**values))
+        proxy = _spawn(
+            f"proxy-multi-{n}",
+            [sys.executable, "-m", "relay", "--config", str(cfg)],
+            cfg_dir,
+            logdir,
+        )
+        processes.append(proxy)
+        await wait_http(f"http://127.0.0.1:{port}/healthz")
+
+        state = {"ta": None, "tb": None}
+
+        async def start_target_a() -> None:
+            if state["ta"] is not None:
+                return
+            proc = _spawn(
+                f"target-a-{n}",
+                [sys.executable, str(REPO / "tests/mocks/mock_target.py")],
+                root,
+                logdir,
+                {"MOCK_TARGET_PORT": str(target_a_port), "MOCK_DELAY": str(delay_a)},
+            )
+            processes.append(proc)
+            state["ta"] = proc
+            await wait_http(f"http://127.0.0.1:{target_a_port}/health")
+
+        async def start_target_b() -> None:
+            if state["tb"] is not None:
+                return
+            proc = _spawn(
+                f"target-b-{n}",
+                [sys.executable, str(REPO / "tests/mocks/mock_target.py")],
+                root,
+                logdir,
+                {"MOCK_TARGET_PORT": str(target_b_port), "MOCK_DELAY": str(delay_b)},
+            )
+            processes.append(proc)
+            state["tb"] = proc
+            await wait_http(f"http://127.0.0.1:{target_b_port}/health")
+
+        def stop_target_a() -> None:
+            if state["ta"] is not None:
+                _stop(state["ta"])
+                state["ta"] = None
+
+        def stop_target_b() -> None:
+            if state["tb"] is not None:
+                _stop(state["tb"])
+                state["tb"] = None
+
+        async def monitor() -> dict:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/monitor/data", timeout=5)
+                response.raise_for_status()
+                return response.json()
+
+        async def alpha_actions() -> list:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://127.0.0.1:{bmc_port}/actions", timeout=5)
+                return response.json()["actions"]
+
+        def stop() -> None:
+            _stop(proxy)
+            _stop(bmc)
+            stop_target_a()
+            stop_target_b()
+
+        if target_a_up:
+            await start_target_a()
+        if target_b_up:
+            await start_target_b()
+
+        return SimpleNamespace(
+            name=name,
+            port=port,
+            bmc_port=bmc_port,
+            target_a_port=target_a_port,
+            target_b_port=target_b_port,
+            dir=cfg_dir,
+            db=values["db"],
+            monitor=monitor,
+            alpha_actions=alpha_actions,
+            start_target_a=start_target_a,
+            start_target_b=start_target_b,
+            stop_target_a=stop_target_a,
+            stop_target_b=stop_target_b,
+            stop=stop,
+        )
+
+    yield SimpleNamespace(root=root, make=make)
+    for proc in processes:
+        _stop(proc)

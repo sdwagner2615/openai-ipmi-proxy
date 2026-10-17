@@ -5,9 +5,26 @@ import time
 import aiosqlite
 import pytest
 
-from relay.store import Store
+from relay.store import RequestRecord, Store
 
 pytestmark = pytest.mark.unit
+
+
+def _record(**overrides) -> RequestRecord:
+    base = {
+        "ts": time.time(),
+        "server": "ws",
+        "endpoint": "llm",
+        "client": "c",
+        "session_id": "s",
+        "wait_seconds": 1.5,
+        "active_seconds": 2.5,
+        "status_code": 200,
+        "request_bytes": 10,
+        "response_bytes": 42,
+    }
+    base.update(overrides)
+    return RequestRecord(**base)
 
 
 async def test_open_applies_migrations_to_fresh_db(tmp_path):
@@ -174,3 +191,44 @@ async def test_in_memory_store_is_safe(tmp_path):
     rows2 = await store2.reconcile_servers(["ws"])
     assert rows2["ws"].owned is False
     await store2.close()
+
+
+async def test_enqueue_stages_until_flush(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    await store.enqueue_request(_record())
+    await store.enqueue_request(_record(status_code=502, response_bytes=0))
+    # Nothing is persisted until the flusher runs.
+    assert await store.get_requests() == []
+    flushed = await store.flush_requests()
+    assert flushed == 2
+    got = await store.get_requests()
+    assert len(got) == 2
+    assert {r["status_code"] for r in got} == {200, 502}
+    assert all(r["endpoint"] == "llm" and r["server"] == "ws" for r in got)
+    # The buffer is drained by the flush.
+    assert store._request_buffer == []
+    await store.close()
+
+
+async def test_flush_requests_empty_is_a_noop(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    assert await store.flush_requests() == 0
+    assert await store.get_requests() == []
+    await store.close()
+
+
+async def test_upsert_session_creates_and_increments(tmp_path):
+    db_path = str(tmp_path / "relay.db")
+    store = Store(db_path)
+    await store.open()
+    for _ in range(3):
+        await store.upsert_session("opencode", "abc", "llm")
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "SELECT client, session_id, endpoint, request_count FROM sessions"
+        )
+        row = await cursor.fetchone()
+    assert row == ("opencode", "abc", "llm", 3)
+    await store.close()

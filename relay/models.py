@@ -30,6 +30,9 @@ class ProxyConfig:
     target_read_timeout: int = 0
     # Generic fallback session headers (D22 step 2), checked in order.
     session_id_headers: list[str] = field(default_factory=lambda: ["x-session-id"])
+    # Shutdown-engine tick cadence in seconds (idle off + cron off). Kept
+    # configurable so tests can drive the 60s engine with a short interval.
+    shutdown_tick: float = 60.0
     store: StoreConfig = field(default_factory=StoreConfig)
 
 
