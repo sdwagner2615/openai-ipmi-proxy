@@ -7,12 +7,12 @@ is promoted, and keeps it until it is genuinely done with the model.
 
 "Genuinely done" depends on the client:
 
-- known clients (e.g. OpenCode) report their real session state (busy /
-  idle / retry) over their own API, so a session that finished its HTTP
-  response but is still inside a long tool call keeps its spot and protects
-  its K/V cache;
-- unknown clients are assumed busy for `busy_window` seconds after their
-  last request.
+- known clients (white-glove clients with a status source) report their
+  real session state (busy / idle / retry) over their own API, so a session
+  that finished its HTTP response but is still inside a long tool call keeps
+  its spot and protects its K/V cache;
+- unknown clients (and clients without a status source) are assumed busy
+  for `busy_window` seconds after their last request.
 
 A spot is surrendered `session_expiry` seconds after the session went idle
 (unknown clients: `session_expiry` after their last request, whichever is
@@ -40,13 +40,13 @@ needs no separate slot. Sharing is checked dynamically: if the ancestor's
 spot is released, the child simply stops sharing and queues like any other
 session. Sharing never takes a spot from another session.
 
-Idle detection for known clients: OpenCode never reports a literal "idle"
-status - it REMOVES idle sessions from its status map, so a fresh poll that
-lacks a tracked session IS the client's idle report (the poller records it
-as client_status "idle"). A session blocked on user input (a pending
-permission or question) stays "busy" in that map, so the poller also checks
-the client's pending-request endpoints and records such sessions as
-client_status "waiting".
+Idle detection for known clients: a status source only reports ACTIVE
+sessions (opencode REMOVES idle sessions from its map), so a fresh poll
+that lacks a tracked session IS the client's idle report (recorded as
+client_status "idle"). A session blocked on user input (a pending
+permission or question) stays "busy" in that map, so the source's
+pending-input endpoints are the tie-breaker and such sessions are recorded
+as client_status "waiting".
 
 Immediate idle release (immediate_idle_release): by default a known client
 keeps its spot for `session_expiry` after it goes idle, so a short gap does
