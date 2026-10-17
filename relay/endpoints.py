@@ -441,6 +441,7 @@ class EndpointRuntime:
                     self.name,
                     client_ip,
                     lowered.get("user-agent", ""),
+                    known=client_name in self.sources,
                 )
                 held = await self._hold_ws_spot(
                     websocket, session, disconnected, self.config.queue_timeout or None
@@ -562,7 +563,12 @@ class EndpointRuntime:
             lowered, client_ip, body=body, body_fields=tuple(self.config.session_id_body_fields)
         )
         session = self.queue.get_or_create_session(
-            client_name, session_id, self.name, client_ip, lowered.get("user-agent", "")
+            client_name,
+            session_id,
+            self.name,
+            client_ip,
+            lowered.get("user-agent", ""),
+            known=client_name in self.sources,
         )
         client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
         await self.store.upsert_session(client_name, session_id, self.name)

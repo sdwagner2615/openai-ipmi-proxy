@@ -81,6 +81,10 @@ class Session:
     user_agent: str
     created_at: float
     last_request_at: float
+    # True when the client has a status source (reports real session state);
+    # False -> busy-window inference like unknown clients (this includes
+    # white-glove clients configured with status.kind: none).
+    known: bool = False
     last_path: str = ""
     status: str = "busy"
     status_detail: str = ""
@@ -151,7 +155,13 @@ class EndpointQueue:
     # -- session handling -------------------------------------------------
 
     def get_or_create_session(
-        self, client: str, session_id: str, api: str, client_ip: str, user_agent: str
+        self,
+        client: str,
+        session_id: str,
+        api: str,
+        client_ip: str,
+        user_agent: str,
+        known: bool,
     ) -> Session:
         key = (client, session_id)
         now = time.monotonic()
@@ -166,6 +176,7 @@ class EndpointQueue:
                 user_agent=user_agent,
                 created_at=now,
                 last_request_at=now,
+                known=known,
             )
             self.sessions[key] = session
         else:
@@ -315,7 +326,7 @@ class EndpointQueue:
     def _current_status(self, session: Session, now: float) -> tuple:
         if session.inflight > 0:
             return "busy", "in-flight request"
-        if session.client != "unknown":
+        if session.known:
             if session.client_status and now - session.client_status_at < STATUS_UNREACHABLE_GRACE:
                 return session.client_status, session.client_status_detail
             return "idle", ""
@@ -335,7 +346,7 @@ class EndpointQueue:
         """Monotonic deadline at which the session's spot is surrendered."""
         if session.inflight > 0:
             return None
-        if session.client != "unknown":
+        if session.known:
             if session.status not in ("idle", "waiting") or session.idle_since is None:
                 return None
             if session.status == "waiting":
