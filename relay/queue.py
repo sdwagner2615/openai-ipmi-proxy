@@ -1,37 +1,39 @@
-"""
-Session queue with FIFO ordering and spot-based concurrency.
+"""Per-endpoint session queue with FIFO ordering and slot ("spot") concurrency.
 
-Concurrency is modelled with "spots": a session acquires one of
-CONCURRENT_SESSIONS spots when its first request is promoted, and keeps it
-until it is genuinely done with the model. "Genuinely done" depends on the
-client:
+Generalization of the original session_queue.py: one EndpointQueue per
+endpoint (D8/D16), with identical semantics. Concurrency is modelled with
+"spots": a session acquires one of `max_spots` slots when its first request
+is promoted, and keeps it until it is genuinely done with the model.
+
+"Genuinely done" depends on the client:
 
 - known clients (e.g. OpenCode) report their real session state (busy /
   idle / retry) over their own API, so a session that finished its HTTP
   response but is still inside a long tool call keeps its spot and protects
   its K/V cache;
-- unknown clients are assumed busy for CLIENT_BUSY_WINDOW seconds after
-  their last request.
+- unknown clients are assumed busy for `busy_window` seconds after their
+  last request.
 
-A spot is surrendered SESSION_EXPIRY seconds after the session went idle
-(unknown clients: SESSION_EXPIRY after their last request, whichever is
+A spot is surrendered `session_expiry` seconds after the session went idle
+(unknown clients: `session_expiry` after their last request, whichever is
 longer than the busy window). When a spot is surrendered the session is
 forgotten, so any future request with the same id is queued at the back as
 a new session.
 
-Within a session, CONCURRENT_SESSION_REQUESTS bounds in-flight requests
+Within a session, `max_inflight_per_session` bounds in-flight requests
 (-1 unlimited, 0 strictly serialized). The waiting queue itself is a plain
-global FIFO: an entry is promoted when its session may run (spot available
-or already held, per-session cap not hit).
+FIFO: an entry is promoted when its session may run (spot available or
+already held, per-session cap not hit) and the endpoint is READY.
 
 Request mode (atomic_requests):
 - parallel (default): spot-holding sessions run their in-flight requests
   concurrently;
-- atomic: at most one in-flight request globally at any moment. Spots still
-  overlap (each session keeps its K/V cache warm), but requests alternate:
-  a waiting entry is only promoted while no request anywhere is in flight.
+- atomic: at most one in-flight request within the endpoint at any moment.
+  Spots still overlap (each session keeps its K/V cache warm), but requests
+  alternate: a waiting entry is only promoted while no request in the
+  endpoint is in flight.
 
-Sub-agent spot sharing: a session whose opencode parentID chain leads to a
+Sub-agent spot sharing: a session whose client parent-id chain leads to a
 tracked session can run on that ancestor's spot (shared_spot_key) instead
 of holding one of its own - a sub-agent is part of its parent's turn, so it
 needs no separate slot. Sharing is checked dynamically: if the ancestor's
@@ -47,32 +49,34 @@ the client's pending-request endpoints and records such sessions as
 client_status "waiting".
 
 Immediate idle release (immediate_idle_release): by default a known client
-keeps its spot for SESSION_EXPIRY after it goes idle, so a short gap does
+keeps its spot for `session_expiry` after it goes idle, so a short gap does
 not evict its K/V cache. When enabled, a known client that truly reports it
 is idle (fresh report, not the unreachable-grace fallback) surrenders its
-spot immediately; unknown clients and inferred idle are unaffected. A
-fresh "waiting for input" report always releases the spot immediately
+spot immediately; unknown clients and inferred idle are unaffected. A fresh
+"waiting for input" report always releases the spot immediately
 (regardless of the flag): a blocked session will not make another model
 call until a human acts, so there is no cache to protect.
 """
 
 import asyncio
+import contextlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
 
-from clients import STATUS_UNREACHABLE_GRACE
+from starlette.requests import Request
 
-__all__ = ["Session", "QueueEntry", "SessionQueue", "UnknownTracker"]
+from relay.clients import STATUS_UNREACHABLE_GRACE
+
+__all__ = ["EndpointQueue", "QueueEntry", "Session", "UnknownTracker"]
 
 
 @dataclass
 class Session:
-    key: tuple  # (client, session_id)
-    client: str  # known client name ("opencode") or "unknown"
+    key: tuple  # (client, session_id); scoped to the endpoint by its queue
+    client: str  # white-glove client name or "unknown"
     session_id: str
-    api: str  # "openai" / "anthropic"
+    api: str  # endpoint name (the session's endpoint)
     client_ip: str
     user_agent: str
     created_at: float
@@ -86,13 +90,13 @@ class Session:
     spot_acquired_at: float = 0.0
     # Sub-agent spot sharing: the queue key of the tracked ancestor whose
     # spot this session runs on (None when it holds its own spot or none).
-    shared_spot_key: Optional[tuple] = None
-    idle_since: Optional[float] = None
+    shared_spot_key: tuple | None = None
+    idle_since: float | None = None
     # Last state learned from the client's status API (known clients only):
     # "busy" / "retry" from the status map, "idle" when a fresh poll lacks
     # the session (opencode's idle report), "waiting" when it is blocked on
     # a pending permission or question (detail carries which).
-    client_status: Optional[str] = None
+    client_status: str | None = None
     client_status_detail: str = ""
     client_status_at: float = 0.0
 
@@ -105,13 +109,15 @@ class QueueEntry:
     # The Starlette Request, kept so a held request can notice its client
     # hanging up while it waits its turn (method/headers stay readable on
     # it for the whole handler lifetime).
-    request: object
+    request: Request
     enqueued_at: float
     go: asyncio.Event = field(default_factory=asyncio.Event)
     done: bool = False  # True once promoted (left the waiting queue)
 
 
-class SessionQueue:
+class EndpointQueue:
+    """The FIFO + spot queue for one endpoint's queued traffic."""
+
     def __init__(
         self,
         max_spots: int,
@@ -126,21 +132,21 @@ class SessionQueue:
         self.max_inflight_per_session = max_inflight_per_session
         self.busy_window = busy_window
         self.session_expiry = session_expiry
-        # atomic: admit at most one in-flight request globally at a time.
+        # atomic: admit at most one in-flight request within the endpoint.
         self.atomic_requests = atomic_requests
         self.inflight_total = 0
         # Known clients that truly report "idle" surrender their spot
-        # immediately instead of waiting SESSION_EXPIRY.
+        # immediately instead of waiting session_expiry.
         self.immediate_idle_release = immediate_idle_release
         self.sessions: dict[tuple, Session] = {}
         # spot-holding sessions, keyed by session key; dict order is the
         # order in which spots were acquired (used for monitor ordering).
         self.spots: dict[tuple, float] = {}
         self.queue: deque[QueueEntry] = deque()
-        # Whether the target server is reachable. Promotion is only allowed
-        # while healthy so requests wait in the queue (instead of failing)
-        # while the proxy wakes the machine up.
-        self.healthy: bool = False
+        # Whether the endpoint is READY. Promotion is only allowed while
+        # ready so requests wait in the queue (instead of failing) while
+        # the proxy wakes the machine up.
+        self.ready: bool = False
 
     # -- session handling -------------------------------------------------
 
@@ -181,7 +187,7 @@ class SessionQueue:
         self.queue.append(entry)
         self._try_promote()
 
-    def _spot_key(self, session: Session) -> Optional[tuple]:
+    def _spot_key(self, session: Session) -> tuple | None:
         """
         The spot this session runs on: its own, or - for a sub-agent - the
         spot of the tracked ancestor it is sharing. None when the session
@@ -195,7 +201,7 @@ class SessionQueue:
         return None
 
     def _eligible(self, entry: QueueEntry) -> bool:
-        # atomic mode: nothing runs while any request anywhere is in flight.
+        # atomic mode: nothing runs while any request is in flight.
         if self.atomic_requests and self.inflight_total > 0:
             return False
         session = entry.session
@@ -213,11 +219,11 @@ class SessionQueue:
         skipped and keep their position (FIFO is preserved among eligible
         entries).
         """
-        if not self.healthy:
+        if not self.ready:
             return
         now = time.monotonic()
         while True:
-            target = None
+            target: QueueEntry | None = None
             for entry in self.queue:
                 if self._eligible(entry):
                     target = entry
@@ -232,7 +238,7 @@ class SessionQueue:
             self.inflight_total += 1
             session.idle_since = None
             # A sub-agent running on a shared spot acquires no spot of its
-            # own (that would let more sessions run than CONCURRENT_SESSIONS).
+            # own (that would let more sessions run than max_spots).
             if self._spot_key(session) is None:
                 self.spots[session.key] = now
                 session.spot_held = True
@@ -244,10 +250,8 @@ class SessionQueue:
     def _remove_waiting(self, entry: QueueEntry) -> None:
         if entry.done:
             return
-        try:
+        with contextlib.suppress(ValueError):
             self.queue.remove(entry)
-        except ValueError:
-            pass
         entry.session.waiting = max(0, entry.session.waiting - 1)
 
     def abandon(self, entry: QueueEntry) -> None:
@@ -257,7 +261,7 @@ class SessionQueue:
     def release_session(self, client: str, session_id: str) -> bool:
         """
         Manually surrenders a session's spot right now (same effect as
-        SESSION_EXPIRY elapsing): the spot is freed for the next waiting
+        session_expiry elapsing): the spot is freed for the next waiting
         session and the session is forgotten, so future requests with the
         same id queue at the back as a new session. Returns True when a
         spot was actually released.
@@ -269,7 +273,7 @@ class SessionQueue:
         self._release_spot(session, key)
         return True
 
-    def release(self, entry: QueueEntry, status_code: Optional[int]) -> None:
+    def release(self, entry: QueueEntry, status_code: int | None) -> None:
         """
         Called exactly once when an in-flight request finishes (the
         status_code is kept for future use; status is otherwise driven by
@@ -282,7 +286,7 @@ class SessionQueue:
         session.last_request_at = time.monotonic()
         self._try_promote()
 
-    async def wait_for_slot(self, entry: QueueEntry, timeout: Optional[float]) -> str:
+    async def wait_for_slot(self, entry: QueueEntry, timeout: float | None) -> str:
         """
         Blocks until the entry is promoted ("ok"), its client goes away
         ("disconnected"), or the queue hold timeout elapses ("timed_out").
@@ -294,7 +298,7 @@ class SessionQueue:
         True, the entry was already promoted and the caller must release it
         instead of abandoning it.
         """
-        deadline = None
+        deadline: float | None = None
         if timeout and timeout > 0:
             deadline = entry.enqueued_at + timeout
         while True:
@@ -327,7 +331,7 @@ class SessionQueue:
             and now - session.client_status_at < STATUS_UNREACHABLE_GRACE
         )
 
-    def _release_deadline(self, session: Session, now: float) -> Optional[float]:
+    def _release_deadline(self, session: Session, now: float) -> float | None:
         """Monotonic deadline at which the session's spot is surrendered."""
         if session.inflight > 0:
             return None
@@ -346,9 +350,15 @@ class SessionQueue:
                 self.immediate_idle_release
                 and session.client_status == "idle"
                 and self._fresh_client_report(session, now)
+                and session.client_status_at > session.last_request_at
             ):
                 # The client truly told us it is idle (fresh report, not the
-                # unreachable-grace fallback): no cooldown, release now.
+                # unreachable-grace fallback) AFTER we served its last
+                # request: no cooldown, release now. A report older than the
+                # last response is stale - it was recorded while we were
+                # still serving that request, and must not release the spot
+                # the moment the response lands (deviation D-immediate-stale,
+                # recorded in docs/relay/progress.md).
                 return session.idle_since
             return session.idle_since + self.session_expiry
         # Unknown clients: busy window and expiry are both measured from
@@ -381,7 +391,7 @@ class SessionQueue:
         released. Called ~1/s by the queue manager after client-status
         polling.
         """
-        released = []
+        released: list = []
         for key, session in list(self.sessions.items()):
             status, detail = self._current_status(session, now)
             session.status = status
@@ -413,7 +423,7 @@ class SessionQueue:
         """
         Sessions ordered by queue position: spot holders first (in spot
         acquisition order), then sessions with waiting requests in FIFO
-        order of their earliest waiting entry.
+        order of their earliest waiting entry, then shared-spot sub-agents.
         """
         first_pos: dict = {}
         for i, entry in enumerate(self.queue, start=1):
@@ -430,7 +440,7 @@ class SessionQueue:
                 ordered.append(session)
         # Sub-agents running on a shared spot hold no spot of their own and
         # may have nothing waiting - they are still active and must be listed.
-        for key, session in list(self.sessions.items()):
+        for session in list(self.sessions.values()):
             if (
                 session.shared_spot_key is not None
                 and session.shared_spot_key in self.spots
@@ -440,7 +450,7 @@ class SessionQueue:
 
         rows = []
         for idx, session in enumerate(ordered, start=1):
-            releases_in = None
+            releases_in: float | None = None
             spot = "none"
             if session.key in self.spots:
                 spot = "held"
@@ -480,20 +490,19 @@ class SessionQueue:
 
 class UnknownTracker:
     """
-    Tracks requests that do not match any known API and are allowed through
-    unqueued. Keyed by client (source IP + user agent); shown in the
-    monitor's second list with the URL they are targeting.
+    Tracks passthrough/catch-all requests (D17): traffic routed through the
+    proxy without queueing or session tracking. Keyed by client (source IP +
+    user agent); shown in the monitor's second list with the URL it is
+    targeting.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.entries: dict[tuple, dict] = {}
 
-    def record(
-        self, ip: str, user_agent: str, method: str, path: str, target_url: str
-    ) -> None:
+    def record(self, ip: str, user_agent: str, method: str, path: str, target_url: str) -> None:
         key = (ip, user_agent or "-")
         now = time.monotonic()
-        entry = self.entries.get(key)
+        entry: dict | None = self.entries.get(key)
         if entry is None:
             self.entries[key] = {
                 "ip": ip,
@@ -513,15 +522,11 @@ class UnknownTracker:
             entry["count"] += 1
 
     def prune(self, now: float, expiry: float) -> None:
-        for key in [
-            k
-            for k, e in self.entries.items()
-            if now - e["last_at"] >= expiry
-        ]:
+        for key in [k for k, e in self.entries.items() if now - e["last_at"] >= expiry]:
             del self.entries[key]
 
     def snapshot(self, now: float) -> list:
-        rows = [
+        rows: list = [
             {
                 "id": f"{e['ip']} ({e['ua']})",
                 "method": e["method"],

@@ -1,0 +1,28 @@
+# Smoke config: boots with no hardware (noop server) for `make smoke` and
+# the CI container job. Not a production template — see config.yaml.sample.
+proxy:
+  host: 0.0.0.0
+  port: 8000
+  store:
+    # Exercises the image default (RELAY_DB_PATH=/data/relay.db) and the
+    # runtime schema migration; `make smoke` asserts the file appears.
+    path: ${RELAY_DB_PATH:-/tmp/relay.db}
+servers:
+  - name: local-dev
+    type: noop
+    power:
+      initial_state: on
+    service_url: http://127.0.0.1:8100
+    idle_timeout: 3600
+    shutdown_enabled: false
+endpoints:
+  - name: default
+    server: local-dev
+    path_prefix: /v1
+    catch_all: true
+    readiness:
+      path: /health
+      interval: 1
+      timeout: 1
+    wait_policy: wait
+    routing: concurrent

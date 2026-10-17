@@ -3,10 +3,10 @@ Mock OpenCode status server for local proxy tests.
 
 Models the real opencode server's per-directory (per-instance) behavior:
   GET  /session/status?directory=<dir> -> {sid: {"type": ...}}
-                                             ({} unless directory matches;
-                                              idle sessions are ABSENT)
+                                              ({} unless directory matches;
+                                               idle sessions are ABSENT)
   GET  /session/{sid}                   -> {"id": sid, "directory": <dir>,
-                                             "parentID": <p> (if sub-agent)}
+                                              "parentID": <p> (if sub-agent)}
   GET  /permission?directory=<dir>      -> pending permission requests
   GET  /question?directory=<dir>        -> pending question requests
   POST /set?sid=X&type=busy|idle|retry  -> set a session's status
@@ -51,8 +51,7 @@ async def permission_list(directory: str = Query(default="")):
     if directory != MOCK_DIR:
         return []
     return [
-        {"id": f"per_{sid}", "sessionID": sid, "permission": "edit"}
-        for sid in pending_permissions
+        {"id": f"per_{sid}", "sessionID": sid, "permission": "edit"} for sid in pending_permissions
     ]
 
 
@@ -72,10 +71,7 @@ async def permission_set(sid: str = Query(...)):
 async def question_list(directory: str = Query(default="")):
     if directory != MOCK_DIR:
         return []
-    return [
-        {"id": f"que_{sid}", "sessionID": sid, "questions": []}
-        for sid in pending_questions
-    ]
+    return [{"id": f"que_{sid}", "sessionID": sid, "questions": []} for sid in pending_questions]
 
 
 @app.delete("/question")
