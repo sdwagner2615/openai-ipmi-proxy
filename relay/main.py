@@ -17,7 +17,7 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from relay.clients import ClientRegistry, StatusPoller, provider_from_config
+from relay.clients import ClientRegistry, StatusSource
 from relay.config import ConfigError, load_config
 from relay.endpoints import EndpointRuntime, route
 from relay.models import RelayConfig
@@ -25,6 +25,7 @@ from relay.monitor import HTML_PAGE, build_data
 from relay.power import create_power_backend
 from relay.queue import UnknownTracker
 from relay.servers import ServerRuntime
+from relay.status_opencode import create_status_source
 from relay.store import Store
 
 logger = logging.getLogger("relay")
@@ -51,7 +52,7 @@ class RelayApp:
                 shutdown_tick=config.proxy.shutdown_tick,
             )
         self.registry = ClientRegistry(config.clients, config.proxy.session_id_headers)
-        self.pollers: dict[str, StatusPoller] = {}
+        self.sources: dict[str, StatusSource] = {}
         self.endpoints: dict[str, EndpointRuntime] = {}
         self.catch_all: EndpointRuntime | None = None
         self.unknown_tracker = UnknownTracker()
@@ -61,20 +62,15 @@ class RelayApp:
         self.started_at = time.monotonic()
 
     def setup(self) -> None:
-        """Builds the status pollers and the endpoint runtimes (needs http)."""
+        """Builds the status sources and the endpoint runtimes (needs http)."""
         http_client = self.http_client
         if http_client is None:
             raise RuntimeError("setup() must run after the shared HTTP client exists")
         for client_config in self.config.clients:
-            if client_config.status.kind != "opencode":
-                continue  # kind: none -> busy-window inference only
-            self.pollers[client_config.name] = StatusPoller(
-                http_client,
-                provider_from_config(client_config),
-                port=client_config.status.port,
-                password=client_config.status.password,
-                poll_interval=client_config.status.poll_interval,
-            )
+            source = create_status_source(client_config, http_client)
+            if source is not None:
+                # kind: none -> no source, busy-window inference only.
+                self.sources[client_config.name] = source
         for endpoint_config in self.config.endpoints:
             server = self.servers[endpoint_config.server]
             endpoint = EndpointRuntime(
@@ -82,7 +78,7 @@ class RelayApp:
                 server,
                 http_client=http_client,
                 store=self.store,
-                pollers=self.pollers,
+                sources=self.sources,
                 registry=self.registry,
                 unknown_tracker=self.unknown_tracker,
                 read_timeout=self.target_read_timeout,
