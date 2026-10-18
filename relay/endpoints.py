@@ -19,17 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import Request, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
-from relay.clients import StatusPoller, detect_client, resolve_shared_spot, session_header_value
+from relay.clients import ClientRegistry, StatusSource, resolve_shared_spot
 from relay.power.base import PowerState
 from relay.queue import EndpointQueue, QueueEntry, UnknownTracker
 from relay.store import RequestRecord
@@ -45,107 +44,8 @@ logger = logging.getLogger("relay.endpoints")
 
 __all__ = [
     "EndpointRuntime",
-    "extract_body_field",
-    "resolve_session_id",
     "route",
 ]
-
-
-def extract_body_field(body: bytes, dotted_path: str) -> str | None:
-    """Walks a dotted path (e.g. "metadata.user_id") into a JSON body (S3).
-
-    Returns the value as a string when it is a non-empty string (or a
-    number), else None. Never raises on malformed input.
-    """
-    try:
-        data: Any = json.loads(body)
-    except (ValueError, TypeError):
-        return None
-    for part in dotted_path.split("."):
-        if not isinstance(data, dict) or part not in data:
-            return None
-        data = data[part]
-    if isinstance(data, str) and data:
-        return data
-    if isinstance(data, (int, float)) and not isinstance(data, bool):
-        return str(data)
-    return None
-
-
-def resolve_session_id(
-    request: Request,
-    body: bytes,
-    endpoint: EndpointRuntime,
-    providers: list,
-    generic_headers: list[str],
-) -> tuple[str, str]:
-    """Identifies the session for a request (S1, D22).
-
-    Precedence:
-      1. a white-glove client's own session headers (plain, then UA-gated),
-      2. the configured generic session headers,
-      3. the endpoint's body fields (e.g. OpenAI "user", Anthropic
-         "metadata.user_id"),
-      4. User-Agent + client source IP as a last resort.
-    (WS query params join at step 4 with the Phase-1 WS transport.)
-    """
-    lowered = {k.lower(): v for k, v in request.headers.items()}
-    client_ip = request.client.host if request.client else "unknown"
-    user_agent = lowered.get("user-agent", "")
-
-    provider = detect_client(lowered, providers)
-    if provider is not None:
-        value = session_header_value(provider, lowered)
-        if value:
-            return provider.name, value
-    for header in generic_headers:
-        value = lowered.get(header)
-        if value:
-            return "unknown", value
-    for dotted in endpoint.config.session_id_body_fields:
-        value = extract_body_field(body, dotted)
-        if value is not None:
-            return "unknown", value
-    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
-
-
-def resolve_session_id_ws(
-    websocket: WebSocket,
-    endpoint: EndpointRuntime,
-    providers: list,
-    generic_headers: list[str],
-) -> tuple[str, str]:
-    """Identifies the session for a WebSocket (D22, no body).
-
-    Precedence: (1) a white-glove client's own headers, (2) the configured
-    generic headers, (3) WS query params mirroring the configured header names
-    (white-glove first, then generic) — WS URLs carry ids/tokens in the query
-    string — (4) UA + source IP as a last resort.
-    """
-    lowered = {k.lower(): v for k, v in websocket.headers.items()}
-    user_agent = lowered.get("user-agent", "")
-    client_ip = websocket.client.host if websocket.client else "unknown"
-
-    provider = detect_client(lowered, providers)
-    if provider is not None:
-        value = session_header_value(provider, lowered)
-        if value:
-            return provider.name, value
-    for header in generic_headers:
-        value = lowered.get(header)
-        if value:
-            return "unknown", value
-    query = websocket.query_params
-    if provider is not None:
-        for header in provider.session_headers + provider.gated_session_headers:
-            value = query.get(header)
-            if value:
-                return provider.name, value
-    for header in generic_headers:
-        value = query.get(header)
-        if value:
-            return "unknown", value
-    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
 
 
 def route(path: str, endpoints: dict[str, EndpointRuntime]) -> EndpointRuntime | None:
@@ -171,9 +71,8 @@ class EndpointRuntime:
         *,
         http_client: httpx.AsyncClient,
         store: Store,
-        pollers: dict[str, StatusPoller],
-        providers: list,
-        generic_headers: list[str],
+        sources: dict[str, StatusSource],
+        registry: ClientRegistry,
         unknown_tracker: UnknownTracker,
         read_timeout: float = 0,
     ):
@@ -181,9 +80,8 @@ class EndpointRuntime:
         self.server = server
         self.http_client = http_client
         self.store = store
-        self.pollers = pollers
-        self.providers = providers
-        self.generic_headers = generic_headers
+        self.sources = sources
+        self.registry = registry
         self.unknown_tracker = unknown_tracker
         # Live proxy-to-target read timeout (X4); the app refreshes it on
         # every endpoint when the monitor changes it.
@@ -297,97 +195,85 @@ class EndpointRuntime:
         # 1) Client status polling (grouped per client machine).
         bases: dict[tuple, list] = {}
         for session in self.queue.sessions.values():
-            if session.client == "unknown":
+            source = self.sources.get(session.client)
+            if source is None:
+                # "unknown" and kind:none clients have no status source.
                 continue
-            poller = self.pollers.get(session.client)
-            if poller is None:
-                continue
-            base = poller.base_url(session.client_ip)
-            bases.setdefault((poller, base), []).append(session)
-        for (poller, base), sessions in bases.items():
-            if not poller.due(base, now):
+            base = source.base_url(session.client_ip)
+            bases.setdefault((source, base), []).append(session)
+        for (source, base), sessions in bases.items():
+            if not source.due(base, now):
                 continue
             # Stamp the interval at poll start, not completion: stamping after
             # the fetches makes the gap between polls tick period + sleep
             # overshoot - fetch duration, which dips below poll_interval and
             # silently skips every other tick (2s cadence instead of 1s).
-            poller.last_poll[base] = time.monotonic()
-            # The status map is per-directory (one opencode "instance" per
-            # working directory), so first resolve each session's directory
-            # (GET /session/{id}, cached) and then poll one map per
-            # directory. Unreachable lookups are skipped; tick() keeps each
-            # session's last-known status for the grace period.
-            by_dir: dict[str, list] = {}
+            source.last_poll[base] = time.monotonic()
+            # A session's context (e.g. opencode's working directory) is
+            # resolved once (cached in the source), then one status map is
+            # polled per context. Unreachable lookups are skipped; tick()
+            # keeps each session's last-known status for the grace period.
+            by_context: dict[str, list] = {}
             for session in sessions:
-                key = (base, session.session_id)
-                directory = poller.session_dir.get(key)
-                if directory is None:
-                    info = await poller.fetch_session_info(base, session.session_id)
-                    if info is None:
-                        continue
-                    directory, parent_id = info
-                    poller.session_dir[key] = directory
-                    poller.session_parent[key] = parent_id
-                by_dir.setdefault(directory, []).append(session)
+                resolved = await source.resolve_context(base, session.session_id)
+                if resolved is None:
+                    continue
+                context, _parent_id = resolved
+                by_context.setdefault(context, []).append(session)
                 # Sub-agent slot sharing (Q8): a session runs on the spot of
                 # its tracked ancestor, recomputed every poll.
-                if poller.provider.children_kind == "parent-chain":
+                provider = self.registry.by_name.get(session.client)
+                if provider is not None and provider.children_kind == "parent-chain":
                     session.shared_spot_key = resolve_shared_spot(
                         base,
                         session.session_id,
-                        poller,
+                        source,
                         self.queue.sessions,
                         self.queue.spots,
                         session.client,
-                        poller.provider.children_depth,
+                        provider.children_depth,
                     )
                 else:
                     session.shared_spot_key = None
-            for directory, dir_sessions in by_dir.items():
-                data = await poller.fetch_statuses(base, directory)
-                # Sessions blocked on a pending permission or question stay
-                # "busy" in the status map, so the pending-request endpoints
-                # are the tie-breaker (C3). A failed poll (None) keeps the
+            for context, ctx_sessions in by_context.items():
+                statuses = await source.fetch_statuses(base, context)
+                # Sessions blocked on a pending user-input request stay
+                # "busy" in the status map, so the pending endpoints are the
+                # tie-breaker (C3). A failed poll (None) keeps the
                 # last-known state.
-                pending = await poller.fetch_pending(base, directory)
-                if data is not None or pending is not None:
-                    reported = time.monotonic()
-                    for session in dir_sessions:
-                        reason = pending.get(session.session_id) if pending is not None else None
-                        if reason is not None:
-                            if session.client_status != "waiting":
-                                logger.info(
-                                    "Session %s (%s) waiting for user input: %s.",
-                                    session.session_id,
-                                    session.client,
-                                    reason,
-                                )
-                            session.client_status = "waiting"
-                            session.client_status_detail = reason
-                            session.client_status_at = reported
-                            continue
-                        if data is None:
-                            continue
-                        st = data.get(session.session_id)
-                        if not isinstance(st, dict):
-                            # A fresh map that lacks this session IS the
-                            # client's idle report (C2).
-                            session.client_status = "idle"
-                            session.client_status_detail = "absent from status map (idle)"
-                            session.client_status_at = reported
-                            continue
-                        stype = st.get("type")
-                        if stype not in ("busy", "idle", "retry"):
-                            continue
-                        session.client_status = stype
+                pending = await source.fetch_pending(base, context)
+                if statuses is None and pending is None:
+                    continue  # unreachable: last-known status is kept
+                reported = time.monotonic()
+                for session in ctx_sessions:
+                    reason = pending.get(session.session_id) if pending is not None else None
+                    if reason is not None:
+                        if session.client_status != "waiting":
+                            logger.info(
+                                "Session %s (%s) waiting for user input: %s.",
+                                session.session_id,
+                                session.client,
+                                reason,
+                            )
+                        session.client_status = "waiting"
+                        session.client_status_detail = reason
                         session.client_status_at = reported
-                        session.client_status_detail = (
-                            f"attempt {st.get('attempt', '?')}" if stype == "retry" else ""
-                        )
-            # Forget directory cache entries of sessions that are gone.
-            live = {s.session_id for s in sessions}
-            for key in [k for k in poller.session_dir if k[0] == base and k[1] not in live]:
-                poller.forget(key[0], key[1])
+                        continue
+                    if statuses is None:
+                        continue
+                    report = statuses.get(session.session_id)
+                    if report is None:
+                        # A fresh map that lacks this session IS the
+                        # client's idle report (C2).
+                        session.client_status = "idle"
+                        session.client_status_detail = "absent from status map (idle)"
+                        session.client_status_at = reported
+                        continue
+                    session.client_status = report.status
+                    session.client_status_detail = report.detail
+                    session.client_status_at = reported
+            # Forget context/parent caches of sessions that are gone.
+            source.forget_gone(base, {s.session_id for s in sessions})
 
         # 2) Status recompute + spot surrender.
         for key, reason in self.queue.tick(now):
@@ -502,8 +388,8 @@ class EndpointRuntime:
 
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
-        client_name, session_id = resolve_session_id(
-            request, body, self, self.providers, self.generic_headers
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, body=body, body_fields=tuple(self.config.session_id_body_fields)
         )
         client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
         return await self._forward(
@@ -523,8 +409,10 @@ class EndpointRuntime:
         ``passthrough``), then tunnels. The inbound connection is always
         closed exactly once on exit.
         """
-        client_name, session_id = resolve_session_id_ws(
-            websocket, self, self.providers, self.generic_headers
+        lowered = {k.lower(): v for k, v in websocket.headers.items()}
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, query=websocket.query_params
         )
         await websocket.accept()
         client_q: asyncio.Queue = asyncio.Queue()
@@ -547,13 +435,13 @@ class EndpointRuntime:
                     await self._close_ws(websocket)
                     return
             if self.config.routing == "queued" and not passthrough:
-                client_ip = websocket.client.host if websocket.client else "unknown"
                 session = self.queue.get_or_create_session(
                     client_name,
                     session_id,
                     self.name,
                     client_ip,
-                    websocket.headers.get("user-agent", ""),
+                    lowered.get("user-agent", ""),
+                    known=client_name in self.sources,
                 )
                 held = await self._hold_ws_spot(
                     websocket, session, disconnected, self.config.queue_timeout or None
@@ -671,11 +559,16 @@ class EndpointRuntime:
 
         lowered = {k.lower(): v for k, v in request.headers.items()}
         client_ip = request.client.host if request.client else "unknown"
-        client_name, session_id = resolve_session_id(
-            request, body, self, self.providers, self.generic_headers
+        client_name, session_id = self.registry.resolve(
+            lowered, client_ip, body=body, body_fields=tuple(self.config.session_id_body_fields)
         )
         session = self.queue.get_or_create_session(
-            client_name, session_id, self.name, client_ip, lowered.get("user-agent", "")
+            client_name,
+            session_id,
+            self.name,
+            client_ip,
+            lowered.get("user-agent", ""),
+            known=client_name in self.sources,
         )
         client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
         await self.store.upsert_session(client_name, session_id, self.name)
