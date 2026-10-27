@@ -83,6 +83,10 @@ servers:
       secret_key: ${AWS_SECRET_ACCESS_KEY}
       # session_token: ${AWS_SESSION_TOKEN}   # optional
       # profile: my-aws-profile               # alternative to explicit keys
+      # endpoint_url: http://127.0.0.1:8103   # optional: a custom EC2 API
+                                             # endpoint (the test fake,
+                                             # localstack, or a compatible
+                                             # gateway); unset = real AWS
       off_action: stop             # stop (default) | terminate (D10)
     service_url: http://10.0.0.5:80
     idle_timeout: 1800

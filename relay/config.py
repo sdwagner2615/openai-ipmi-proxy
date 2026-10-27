@@ -353,6 +353,7 @@ def _build_power(raw: dict, server_type: str, where: str) -> Any:
             session_token=_get_str_opt(raw, "session_token", where),
             profile=profile,
             off_action=_get_enum(raw, "off_action", where, OFF_ACTIONS, default="stop"),
+            endpoint_url=_get_str_opt(raw, "endpoint_url", where),
         )
     raise ConfigError(f"unsupported server type {server_type!r} in {where}")
 
