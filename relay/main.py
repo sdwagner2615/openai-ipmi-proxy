@@ -14,7 +14,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from relay.clients import StatusPoller, provider_from_config, providers_from_config
@@ -45,7 +45,10 @@ class RelayApp:
         self.servers: dict[str, ServerRuntime] = {}
         for server_config in config.servers:
             self.servers[server_config.name] = ServerRuntime(
-                server_config, create_power_backend(server_config), self.store
+                server_config,
+                create_power_backend(server_config),
+                self.store,
+                shutdown_tick=config.proxy.shutdown_tick,
             )
         self.providers = providers_from_config(config.clients)
         self.pollers: dict[str, StatusPoller] = {}
@@ -115,6 +118,10 @@ class RelayApp:
             self.store.retention_loop(self.config.proxy.store.retention_days),
             name="store-retention",
         )
+        # Batched request writer (Phase 1 task 7): staged rows flushed ~1/s.
+        self._flush_task = asyncio.create_task(
+            self.store.request_flush_loop(1.0), name="store-request-flush"
+        )
         logger.info(
             "relay started: %d server(s) [%s], %d endpoint(s) [%s].",
             len(self.servers),
@@ -127,12 +134,16 @@ class RelayApp:
         """Clean teardown (O4): loops first, then client and store."""
         if getattr(self, "_retention_task", None) is not None:
             self._retention_task.cancel()
+        if getattr(self, "_flush_task", None) is not None:
+            self._flush_task.cancel()
         for endpoint in self.endpoints.values():
             await endpoint.stop()
         for server in self.servers.values():
             await server.stop()
         if self.http_client is not None:
             await self.http_client.aclose()
+        # Drain the request buffer so no completed request is lost on shutdown.
+        await self.store.flush_requests()
         await self.store.close()
         logger.info("relay stopped.")
 
@@ -189,8 +200,8 @@ def create_app(config_path: str | Path) -> FastAPI:
 
     @app.get("/monitor/data")
     async def monitor_data(request: Request):
-        """JSON snapshot of configuration, sessions and passthrough activity."""
-        return JSONResponse(build_data(request.app.state.relay))
+        """JSON snapshot: config, servers, endpoints, sessions, events (monitor v2)."""
+        return JSONResponse(await build_data(request.app.state.relay))
 
     @app.post("/monitor/release")
     async def monitor_release(request: Request):
@@ -248,6 +259,49 @@ def create_app(config_path: str | Path) -> FastAPI:
             )
         await server.set_shutdown_override(data["enabled"])
         return JSONResponse({"shutdown_enabled": data["enabled"]})
+
+    @app.post("/monitor/power")
+    async def monitor_power(request: Request):
+        """Manually powers a server on or off (monitor v2).
+
+        A manual power-on through the proxy counts as proxy-initiated: it takes
+        ownership and starts a new power cycle (D12). A manual power-off releases
+        ownership.
+        """
+        relay: RelayApp = request.app.state.relay
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400, content={"error": "Expected a JSON body {server, action}."}
+            )
+        if not isinstance(data, dict):
+            return JSONResponse(
+                status_code=400, content={"error": "Expected a JSON body {server, action}."}
+            )
+        server_name = data.get("server")
+        action = data.get("action")
+        if not server_name or action not in ("on", "off"):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Expected a JSON body {server, action: on|off}."},
+            )
+        server = relay.servers.get(server_name)
+        if server is None:
+            return JSONResponse(
+                status_code=404, content={"error": f"Unknown server '{server_name}'."}
+            )
+        if action == "on":
+            ok = await server.power_on(reason="manual", initiated_by="monitor-ui")
+        else:
+            ok = await server.power_off(reason="manual", initiated_by="monitor-ui")
+        logger.info(
+            "Manual power %s for server %s from monitor: %s.",
+            action,
+            server_name,
+            "accepted" if ok else "failed",
+        )
+        return JSONResponse({"ok": ok, "server": server_name, "action": action})
 
     @app.post("/monitor/timeout")
     async def monitor_timeout(request: Request):
@@ -323,6 +377,30 @@ def create_app(config_path: str | Path) -> FastAPI:
             return await endpoint.admit_catch_all(request, full_path)
         await endpoint.server.on_routed_traffic()
         return await endpoint.admit(request, full_path)
+
+    @app.websocket("/{path:path}")
+    async def ws_proxy(websocket: WebSocket, path: str):
+        """WebSocket catch-all (D18): mirrors the HTTP proxy's routing.
+
+        Unmatched paths under ``allow`` go to the catch_all endpoint with
+        passthrough semantics (no queue/session); under ``block`` (or with no
+        catch_all) the connection is accepted then closed. Routed connections
+        adopt power ownership of their server (P6).
+        """
+        relay: RelayApp = websocket.app.state.relay
+        full_path = "/" + path
+        endpoint = route(full_path, relay.endpoints)
+        if endpoint is None:
+            if relay.config.proxy.unknown_path_policy != "allow" or relay.catch_all is None:
+                await websocket.accept()
+                await websocket.close(code=1008)
+                return
+            endpoint = relay.catch_all
+            await endpoint.server.on_routed_traffic()
+            await endpoint.admit_ws(websocket, full_path, passthrough=True)
+            return
+        await endpoint.server.on_routed_traffic()
+        await endpoint.admit_ws(websocket, full_path)
 
     return app
 

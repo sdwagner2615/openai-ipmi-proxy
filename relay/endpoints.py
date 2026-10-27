@@ -18,20 +18,23 @@ on, so a successful probe updates the server's power state.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import Request
+from fastapi import Request, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from relay.clients import StatusPoller, detect_client, resolve_shared_spot, session_header_value
 from relay.power.base import PowerState
 from relay.queue import EndpointQueue, QueueEntry, UnknownTracker
+from relay.store import RequestRecord
 from relay.transport.http import forward_request
+from relay.transport.ws import read_client, to_ws_url, tunnel
 
 if TYPE_CHECKING:
     from relay.models import EndpointConfig
@@ -102,6 +105,45 @@ def resolve_session_id(
     for dotted in endpoint.config.session_id_body_fields:
         value = extract_body_field(body, dotted)
         if value is not None:
+            return "unknown", value
+    return "unknown", f"ua:{user_agent}|ip:{client_ip}"
+
+
+def resolve_session_id_ws(
+    websocket: WebSocket,
+    endpoint: EndpointRuntime,
+    providers: list,
+    generic_headers: list[str],
+) -> tuple[str, str]:
+    """Identifies the session for a WebSocket (D22, no body).
+
+    Precedence: (1) a white-glove client's own headers, (2) the configured
+    generic headers, (3) WS query params mirroring the configured header names
+    (white-glove first, then generic) — WS URLs carry ids/tokens in the query
+    string — (4) UA + source IP as a last resort.
+    """
+    lowered = {k.lower(): v for k, v in websocket.headers.items()}
+    user_agent = lowered.get("user-agent", "")
+    client_ip = websocket.client.host if websocket.client else "unknown"
+
+    provider = detect_client(lowered, providers)
+    if provider is not None:
+        value = session_header_value(provider, lowered)
+        if value:
+            return provider.name, value
+    for header in generic_headers:
+        value = lowered.get(header)
+        if value:
+            return "unknown", value
+    query = websocket.query_params
+    if provider is not None:
+        for header in provider.session_headers + provider.gated_session_headers:
+            value = query.get(header)
+            if value:
+                return provider.name, value
+    for header in generic_headers:
+        value = query.get(header)
+        if value:
             return "unknown", value
     return "unknown", f"ua:{user_agent}|ip:{client_ip}"
 
@@ -458,7 +500,159 @@ class EndpointRuntime:
         def _finish(code: int | None) -> None:
             self.active_forwards = max(0, self.active_forwards - 1)
 
-        return await self._forward(request, full_path, body, _finish)
+        lowered = {k.lower(): v for k, v in request.headers.items()}
+        client_ip = request.client.host if request.client else "unknown"
+        client_name, session_id = resolve_session_id(
+            request, body, self, self.providers, self.generic_headers
+        )
+        client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
+        return await self._forward(
+            request, full_path, body, _finish, self._make_record(client, session_id, 0.0)
+        )
+
+    # -- WebSocket admission (D18) -------------------------------------------
+
+    async def admit_ws(
+        self, websocket: WebSocket, full_path: str, *, passthrough: bool = False
+    ) -> None:
+        """Admits a routed WebSocket connection (D18).
+
+        Accepts the upgrade, enforces the wait policy (hold with keep-alives
+        until ready, or close 1013 on ``error``), holds a spot for the
+        connection's lifetime when the endpoint is ``queued`` (unless
+        ``passthrough``), then tunnels. The inbound connection is always
+        closed exactly once on exit.
+        """
+        client_name, session_id = resolve_session_id_ws(
+            websocket, self, self.providers, self.generic_headers
+        )
+        await websocket.accept()
+        client_q: asyncio.Queue = asyncio.Queue()
+        disconnected = asyncio.Event()
+        reader = asyncio.create_task(
+            read_client(websocket, client_q, disconnected), name=f"ws-read-{self.name}"
+        )
+        target_url = to_ws_url(self.server.config.service_url, full_path)
+        try:
+            if not self.queue.queue:
+                await self.check_readiness()
+            if not self.queue.ready:
+                if self.config.wait_policy == "error":
+                    await websocket.close(code=1013, reason="not ready; retry later")
+                    return
+                result = await self._wait_ws_ready(
+                    websocket, disconnected, self.config.queue_timeout or None
+                )
+                if result != "ok":
+                    await self._close_ws(websocket)
+                    return
+            if self.config.routing == "queued" and not passthrough:
+                client_ip = websocket.client.host if websocket.client else "unknown"
+                session = self.queue.get_or_create_session(
+                    client_name,
+                    session_id,
+                    self.name,
+                    client_ip,
+                    websocket.headers.get("user-agent", ""),
+                )
+                held = await self._hold_ws_spot(
+                    websocket, session, disconnected, self.config.queue_timeout or None
+                )
+                if not held:
+                    await self._close_ws(websocket)
+                    return
+                await tunnel(
+                    websocket,
+                    target_url,
+                    client_q,
+                    disconnected,
+                    release=lambda: self._release_ws_spot(session),
+                )
+            else:
+                self.active_forwards += 1
+                try:
+                    await tunnel(websocket, target_url, client_q, disconnected)
+                finally:
+                    self.active_forwards = max(0, self.active_forwards - 1)
+        finally:
+            reader.cancel()
+            await self._close_ws(websocket)
+
+    async def _wait_ws_ready(
+        self, websocket: WebSocket, disconnected: asyncio.Event, timeout: float | None
+    ) -> str:
+        """Holds an accepted WS until the endpoint is ready (wait policy, P1)."""
+        deadline: float | None = None
+        if timeout and timeout > 0:
+            deadline = time.monotonic() + timeout
+        while not self.queue.ready:
+            if disconnected.is_set():
+                return "disconnected"
+            if deadline is not None and time.monotonic() >= deadline:
+                return "timed_out"
+            await self._ws_keep_alive(websocket)
+            await asyncio.sleep(1.0)
+        return "ok"
+
+    async def _hold_ws_spot(
+        self,
+        websocket: WebSocket,
+        session,
+        disconnected: asyncio.Event,
+        timeout: float | None,
+    ) -> bool:
+        """Acquires a spot for a queued WS connection (held for its lifetime).
+
+        Runs on the session's own or shared spot when available, otherwise
+        takes a free one; when none is free it keeps the connection alive and
+        waits. True when a spot is held, False on disconnect/timeout.
+        """
+        deadline: float | None = None
+        if timeout and timeout > 0:
+            deadline = time.monotonic() + timeout
+        while True:
+            if session.key in self.queue.spots:
+                session.inflight += 1
+                return True
+            if session.shared_spot_key is not None and session.shared_spot_key in self.queue.spots:
+                session.inflight += 1
+                return True
+            if len(self.queue.spots) < self.queue.max_spots:
+                now = time.monotonic()
+                self.queue.spots[session.key] = now
+                session.spot_held = True
+                session.spot_acquired_at = now
+                session.inflight += 1
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            if disconnected.is_set():
+                return False
+            await self._ws_keep_alive(websocket)
+            await asyncio.sleep(1.0)
+
+    def _release_ws_spot(self, session) -> None:
+        """Releases a queued WS connection's spot (once, on close)."""
+        if session.inflight > 0:
+            session.inflight -= 1
+        if session.key in self.queue.spots:
+            self.queue.spots.pop(session.key)
+            session.spot_held = False
+            self.queue._try_promote()
+
+    async def _ws_keep_alive(self, websocket: WebSocket) -> None:
+        """Best-effort WS ping keep-alive (ASGI websocket.ping) while waiting.
+
+        A missing/unsupported ping must not break the hold: the accepted
+        connection stays open in the wait loop regardless.
+        """
+        with contextlib.suppress(Exception):
+            await websocket._send({"type": "websocket.ping", "bytes": b"\x00" * 16})
+
+    async def _close_ws(self, websocket: WebSocket) -> None:
+        """Closes the inbound connection once (idempotent, error-suppressed)."""
+        with contextlib.suppress(Exception):
+            await websocket.close()
 
     async def _admit_queued(self, request: Request, full_path: str, body: bytes) -> Response:
         # Readiness gate (D8): a fresh probe on an empty queue, always (P3 —
@@ -483,6 +677,8 @@ class EndpointRuntime:
         session = self.queue.get_or_create_session(
             client_name, session_id, self.name, client_ip, lowered.get("user-agent", "")
         )
+        client = self._client_display(client_name, client_ip, lowered.get("user-agent", ""))
+        await self.store.upsert_session(client_name, session_id, self.name)
         entry = QueueEntry(
             session=session,
             path=full_path,
@@ -520,11 +716,13 @@ class EndpointRuntime:
                 )
             return self._hold_rejected("timed_out", full_path)
 
+        wait_seconds = time.monotonic() - entry.enqueued_at
         return await self._forward(
             request,
             full_path,
             body,
             lambda code: self.queue.release(entry, code),
+            self._make_record(client, session_id, wait_seconds),
         )
 
     def _not_ready(self) -> Response:
@@ -565,12 +763,44 @@ class EndpointRuntime:
             },
         )
 
+    @staticmethod
+    def _client_display(client_name: str, client_ip: str, user_agent: str) -> str:
+        """The client column of the request log (schema: white-glove name or ip/ua)."""
+        if client_name != "unknown":
+            return client_name
+        return f"ip:{client_ip} ({user_agent})"
+
+    def _make_record(self, client: str, session_id: str, wait_seconds: float):
+        """Builds the per-request record callback that stages a RequestRecord."""
+        server = self.server.name
+        endpoint = self.name
+        store = self.store
+
+        async def _record(status_code, request_bytes, response_bytes, active_seconds):
+            await store.enqueue_request(
+                RequestRecord(
+                    ts=time.time(),
+                    server=server,
+                    endpoint=endpoint,
+                    client=client,
+                    session_id=session_id,
+                    wait_seconds=wait_seconds,
+                    active_seconds=active_seconds,
+                    status_code=status_code,
+                    request_bytes=request_bytes,
+                    response_bytes=response_bytes,
+                )
+            )
+
+        return _record
+
     async def _forward(
         self,
         request: Request,
         full_path: str,
         body: bytes,
         release,
+        record=None,
     ) -> Response:
         return await forward_request(
             self.http_client,
@@ -580,6 +810,7 @@ class EndpointRuntime:
             body=body,
             read_timeout=self.read_timeout,
             release=release,
+            record=record,
         )
 
     # -- lifecycle ---------------------------------------------------------
