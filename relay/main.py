@@ -143,7 +143,12 @@ class RelayApp:
         if self.http_client is not None:
             await self.http_client.aclose()
         # Drain the request buffer so no completed request is lost on shutdown.
-        await self.store.flush_requests()
+        # A full disk must not abort the shutdown (D33): flush and close are
+        # both best-effort.
+        try:
+            await self.store.flush_requests()
+        except Exception as e:
+            logger.error("Final request flush failed: %s", e)
         await self.store.close()
         logger.info("relay stopped.")
 
@@ -170,7 +175,13 @@ def create_app(config_path: str | Path) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz(request: Request):
-        """200 while the app and its background loops are alive (D28)."""
+        """200 while the app and its background loops are alive (D28).
+
+        Stays 200 while the store is degraded (D33): the proxy is doing its
+        core job, and a 503 here would make a container orchestrator restart
+        the process (losing the in-memory queue) without fixing the disk. The
+        degradation is surfaced in the body for alerting to key off.
+        """
         relay: RelayApp = request.app.state.relay
         now = time.monotonic()
         for endpoint in relay.endpoints.values():
@@ -191,7 +202,11 @@ def create_app(config_path: str | Path) -> FastAPI:
                         "detail": f"power sync stale for server '{server.name}'",
                     },
                 )
-        return {"status": "ok", "uptime_seconds": round(now - relay.started_at, 1)}
+        return {
+            "status": "ok",
+            "store": "degraded" if relay.store.degraded else "ok",
+            "uptime_seconds": round(now - relay.started_at, 1),
+        }
 
     @app.get("/monitor")
     async def monitor_page():

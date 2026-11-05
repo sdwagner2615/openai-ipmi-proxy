@@ -123,6 +123,12 @@ async def build_data(app) -> dict:
         "sessions": sessions,
         "unknown": app.unknown_tracker.snapshot(now),
         "power_events": await app.store.recent_power_events(),
+        "store": {
+            "degraded": app.store.degraded,
+            "dropped_writes": app.store.dropped_writes,
+            "dropped_requests": app.store.dropped_requests,
+            "path": app.store.path,
+        },
     }
 
 
@@ -153,6 +159,10 @@ HTML_PAGE = """<!doctype html>
   .on { color: #9c9; } .off { color: #f77; } .unknown { color: #999; }
   .shared-spot { color: #c9f; font-weight: bold; }
   .muted { color: #666; font-weight: normal; }
+  #store-banner { display: none; background: #3a1212; border: 1px solid #f77;
+                  color: #faa; padding: .5rem .8rem; margin: 0 0 1rem;
+                  border-radius: 4px; font-size: .9rem; }
+  #store-banner.show { display: block; }
   button.release, button.toggle, button.apply, button.pwr { font-family: inherit;
                     font-size: .72rem; background: #232323; border-radius: 3px;
                     padding: .05rem .4rem; cursor: pointer; vertical-align: middle; }
@@ -174,6 +184,7 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
 <h1>Relay Monitor <span id="updated"></span></h1>
+<div id="store-banner"></div>
 <div id="config" class="kv"></div>
 
 <h2>Servers</h2>
@@ -245,6 +256,17 @@ async function post(url, body) {
 
 function render(d) {
   $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  const sb = $('store-banner');
+  if (d.store && d.store.degraded) {
+    sb.textContent = 'STORE DEGRADED — database writes are failing (disk full?). '
+      + 'Proxying continues normally; record-keeping is dropped. Dropped: '
+      + (d.store.dropped_writes || 0) + ' writes, '
+      + (d.store.dropped_requests || 0) + ' request records. '
+      + 'It recovers automatically once the database is writable again.';
+    sb.classList.add('show');
+  } else {
+    sb.classList.remove('show');
+  }
   $('config').innerHTML = Object.entries(d.config).map(([k, v]) => {
     if (k === 'shutdown_enabled') {
       const on = v === true || v === 'true';
