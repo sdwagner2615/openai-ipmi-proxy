@@ -6,6 +6,9 @@ SQLite schema. Alembic migrations in `relay/migrations` are generated from
 `synchronous=NORMAL` are set on every connection via an engine event.
 """
 
+import os
+import sqlite3
+
 from sqlalchemy import Boolean, Float, Index, Integer, Text, event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -124,5 +127,23 @@ def make_engine(path: str) -> AsyncEngine:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
+
+    # Test hook (D33, storage.md "Test hooks"): while the file named by
+    # ``RELAY_STORE_FAIL_WRITES`` exists, every commit raises the same
+    # OperationalError a full disk produces. This exercises the store's
+    # degraded-mode path end to end (e2e) without a full filesystem, root,
+    # or tmpfs — the flag can be created/removed at runtime to simulate the
+    # disk filling up and being drained again.
+    flag_path = os.environ.get("RELAY_STORE_FAIL_WRITES")
+    if flag_path:
+        original_do_commit = engine.sync_engine.dialect.do_commit
+
+        def _disk_full(dbapi_connection):
+            if os.path.exists(flag_path):
+                raise sqlite3.OperationalError("database or disk is full")
+            original_do_commit(dbapi_connection)
+
+        # Deliberate runtime patch of the dialect's commit hook (test-only).
+        engine.sync_engine.dialect.do_commit = _disk_full  # type: ignore[method-assign]
 
     return engine

@@ -174,8 +174,10 @@ class ServerRuntime:
         """
         self.transient = _TRANSIENT_ON
         ok = await self.backend.power_on()
-        await self.store.log_power_event(self.name, "power_on", reason, initiated_by, ok)
         if ok:
+            # In-memory state first, store mirror second (D33): the mirror is
+            # best-effort, and memory is what routing and the shutdown engine
+            # actually use.
             self.owned = True
             self.shutdown_override = None
             self.cycle_id = str(uuid.uuid4())
@@ -194,6 +196,7 @@ class ServerRuntime:
                 self.name,
                 reason,
             )
+        await self.store.log_power_event(self.name, "power_on", reason, initiated_by, ok)
         return ok
 
     async def power_off(self, *, reason: str = "idle_timeout", initiated_by: str = "proxy") -> bool:
@@ -204,8 +207,8 @@ class ServerRuntime:
         """
         self.transient = _TRANSIENT_OFF
         ok = await self.backend.power_off()
-        await self.store.log_power_event(self.name, "power_off", reason, initiated_by, ok)
         if ok:
+            # In-memory state first, store mirror second (D33).
             self.owned = False
             await self.store.set_server_runtime(self.name, owned=False)
             logger.info(
@@ -216,6 +219,7 @@ class ServerRuntime:
         else:
             self.transient = None
             logger.warning("Server %s: power-off failed (reason=%s).", self.name, reason)
+        await self.store.log_power_event(self.name, "power_off", reason, initiated_by, ok)
         return ok
 
     async def on_routed_traffic(self) -> None:
