@@ -21,11 +21,13 @@ later puts the box to sleep when the work is genuinely done.
   sessions; `concurrency` sessions run at once and the rest wait FIFO. A
   session keeps its spot until it is *genuinely* idle, so the model's K/V
   cache survives between its requests.
-- **Client-aware idleness.** Known clients (opencode) report their real
-  per-session state (`busy` / `idle` / `retry`, and *waiting for user
-  input*) over their own status API; a session blocked on a permission
-  prompt releases its spot immediately. Unknown clients fall back to a
-  busy window after their last request.
+- **Client-aware idleness.** White-glove clients are config entries with
+  pluggable status sources: the reference source (opencode) reports real
+  per-session state (`busy` / `retry`, *waiting for user   input* — and
+  absence from its map, which *is* the idle report); a session blocked on a
+  permission prompt releases its spot immediately. Clients without a
+  status source (`kind: none`) and unknown clients fall back to a busy
+  window after their last request.
 - **Power ownership.** The proxy only ever powers off a server it brought up
   or adopted (routed traffic, `adopt_on_traffic`). A box you turned on
   manually and never use through the proxy is never touched.
@@ -128,6 +130,26 @@ Point clients at the proxy with **no timeout** (or a very large one):
 waiting requests are held until their turn. A client that hangs up
 mid-queue is dropped automatically; `queue_timeout` can cap the wait with a
 504 if you prefer.
+
+### White-glove clients (config-driven)
+
+Clients are `clients:` entries in `config.yaml` (see
+`docs/relay/configuration.md` for the full reference). Each entry:
+
+- **`match`** — how the proxy identifies the client per request:
+  `session_headers` (identify alone) and/or `gated_session_headers`
+  (count only with a matching `ua_prefix`), so other tools sending the same
+  headers are not misattributed. First match in config order wins;
+  everything else is a generic client (source-IP identity, busy window).
+- **`status`** — the pluggable status source (D21). `kind: opencode`
+  (the reference implementation) polls the client's own status API on its
+  source IP: per-working-directory status maps, pending
+  permission/question endpoints, optional basic auth. `kind: none`
+  declares the client (named, scoped sessions) with **no** status source —
+  its sessions use busy-window inference only.
+- **`children`** — child-session slot sharing: `kind: parent-chain`
+  (config `depth`) lets a sub-agent run on its tracked ancestor's spot
+  instead of waiting for one of its own; `none` for no sharing.
 
 ## Development
 
