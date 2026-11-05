@@ -1,13 +1,29 @@
-"""SQLite store: migrations, reconciliation, retention, in-memory safety (D5)."""
+"""SQLite store: migrations, reconciliation, retention, in-memory safety (D5),
+and degraded mode (D33: a full disk never blocks proxying)."""
 
+import sqlite3
 import time
 
 import aiosqlite
 import pytest
+from sqlalchemy.exc import DBAPIError
 
-from relay.store import RequestRecord, Store
+from relay.store import REQUEST_BUFFER_MAX, RequestRecord, Store
 
 pytestmark = pytest.mark.unit
+
+
+def _fail_commits(store: Store) -> None:
+    """Makes every commit raise 'database or disk is full' (deterministic disk-full simulation)."""
+
+    def _raise(connection):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    store._engine.sync_engine.dialect.do_commit = _raise
+
+
+def _restore_commits(store: Store) -> None:
+    del store._engine.sync_engine.dialect.do_commit
 
 
 def _record(**overrides) -> RequestRecord:
@@ -64,6 +80,32 @@ async def test_reopen_is_idempotent(tmp_path):
     rows = await store2.reconcile_servers(["ws"])
     assert rows["ws"].owned is False
     await store2.close()
+
+
+async def test_open_retries_while_db_unwritable(tmp_path):
+    """A full disk at boot delays startup instead of crashing (D33)."""
+    import relay.store as store_module
+
+    store = Store(str(tmp_path / "relay.db"))
+    attempts = {"n": 0}
+    real_upgrade = store._upgrade_schema
+
+    def _flaky_upgrade():
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise sqlite3.OperationalError("database or disk is full")
+        real_upgrade()
+
+    store._upgrade_schema = _flaky_upgrade
+    original = store_module.OPEN_RETRY_INTERVAL
+    store_module.OPEN_RETRY_INTERVAL = 0.01
+    try:
+        await store.open()
+    finally:
+        store_module.OPEN_RETRY_INTERVAL = original
+    assert attempts["n"] == 3  # two failures, then success
+    assert store.degraded is False  # a healthy open leaves no degraded state
+    await store.close()
 
 
 async def test_open_creates_schema_and_round_trips(tmp_path):
@@ -207,7 +249,7 @@ async def test_enqueue_stages_until_flush(tmp_path):
     assert {r["status_code"] for r in got} == {200, 502}
     assert all(r["endpoint"] == "llm" and r["server"] == "ws" for r in got)
     # The buffer is drained by the flush.
-    assert store._request_buffer == []
+    assert len(store._request_buffer) == 0
     await store.close()
 
 
@@ -231,4 +273,121 @@ async def test_upsert_session_creates_and_increments(tmp_path):
         )
         row = await cursor.fetchone()
     assert row == ("opencode", "abc", "llm", 3)
+    await store.close()
+
+
+# -- degraded mode (D33): a full disk never blocks proxying -------------------
+
+
+async def test_write_failure_degrades_store(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    _fail_commits(store)
+    # The request-path write must NOT raise, even with the disk "full".
+    await store.upsert_session("opencode", "abc", "llm")
+    await store.log_power_event("ws", "power_on", "request_wake", "proxy", True)
+    await store.set_server_runtime("ws", power_state="on")
+    await store.set_endpoint_runtime("llm", ready=True, ready_since=1.0, last_check_at=2.0)
+    assert store.degraded is True
+    assert store.dropped_writes == 4
+    await store.close()
+
+
+async def test_store_recovers_when_writes_succeed_again(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    _fail_commits(store)
+    await store.upsert_session("opencode", "abc", "llm")
+    assert store.degraded is True
+    # Disk space freed: the next successful write marks recovery.
+    _restore_commits(store)
+    await store.upsert_session("opencode", "abc", "llm")
+    assert store.degraded is False
+    assert store.dropped_writes == 1  # the one dropped write stays counted
+    async with aiosqlite.connect(str(tmp_path / "relay.db")) as db:
+        cursor = await db.execute("SELECT request_count FROM sessions")
+        row = await cursor.fetchone()
+    assert row == (1,)  # only the post-recovery write landed
+    await store.close()
+
+
+async def test_programming_error_still_raises(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+
+    def _raise(connection):
+        raise sqlite3.ProgrammingError("a code-level SQL bug")
+
+    store._engine.sync_engine.dialect.do_commit = _raise
+    try:
+        with pytest.raises(DBAPIError):
+            await store.upsert_session("opencode", "abc", "llm")
+    finally:
+        _restore_commits(store)
+    # It did not degrade the store: this is a bug to surface, not a condition.
+    assert store.degraded is False
+    await store.close()
+
+
+async def test_corruption_degrades_store(tmp_path):
+    """A corrupted DB ('file is not a database', a plain DatabaseError) also
+    degrades rather than 500ing the request path."""
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+
+    def _raise(connection):
+        raise sqlite3.DatabaseError("file is not a database")
+
+    store._engine.sync_engine.dialect.do_commit = _raise
+    try:
+        await store.upsert_session("opencode", "abc", "llm")
+    finally:
+        _restore_commits(store)
+    assert store.degraded is True
+    await store.close()
+
+
+async def test_reconcile_degrades_to_unowned_rows(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    _fail_commits(store)
+    rows = await store.reconcile_servers(["ws", "other"])
+    # The safe default per D12: nothing is owned, state unknown.
+    assert set(rows) == {"ws", "other"}
+    for row in rows.values():
+        assert row.owned is False
+        assert row.power_state == "unknown"
+        assert row.shutdown_override is None
+    assert store.degraded is True
+    await store.close()
+
+
+async def test_flush_failure_drops_batch_and_counts(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    _fail_commits(store)
+    for _ in range(3):
+        await store.enqueue_request(_record())
+    # A failed flush drops the batch (no exception, no re-queue).
+    assert await store.flush_requests() == 0
+    assert store.degraded is True
+    assert store.dropped_requests == 3
+    _restore_commits(store)
+    await store.enqueue_request(_record())
+    assert await store.flush_requests() == 1
+    assert store.degraded is False
+    assert len(await store.get_requests()) == 1
+    await store.close()
+
+
+async def test_buffer_sheds_oldest_when_full(tmp_path):
+    store = Store(str(tmp_path / "relay.db"))
+    await store.open()
+    for i in range(REQUEST_BUFFER_MAX + 5):
+        await store.enqueue_request(_record(session_id=f"s{i}"))
+    # Bounded: the 5 oldest records were shed and counted.
+    assert len(store._request_buffer) == REQUEST_BUFFER_MAX
+    assert store._request_buffer[0].session_id == "s5"  # s0..s4 shed
+    assert store._request_buffer[-1].session_id == f"s{REQUEST_BUFFER_MAX + 4}"
+    assert store.dropped_requests == 5
     await store.close()

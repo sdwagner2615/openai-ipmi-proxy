@@ -9,6 +9,48 @@ Library: SQLAlchemy 2.0 (async, `aiosqlite` driver), **WAL mode**
 serialized on a store lock). File: `proxy.store.path` (container default:
 `/data/relay.db`).
 
+## Degraded mode (D33): a full disk never stops the proxy
+
+Routing never depends on the store (all routing state is in-memory; the
+request path only *writes* to it, never reads routing data from it). A
+database-level write failure — `disk is full`, `disk I/O error`,
+`readonly database`, `database is locked`, file corruption — therefore
+degrades the store instead of propagating:
+
+- the failing write is **dropped** and counted (`dropped_writes`); the
+  batched request log likewise drops its batch (`dropped_requests`) —
+  records are never re-queued (that would grow RAM without bound while the
+  disk is full);
+- the first failure logs **one** ERROR (with the original exception); the
+  first success after a degradation logs an INFO with the drop counts — no
+  per-write spam while the disk is full;
+- every write keeps attempting, so the store **recovers automatically** on
+  the next successful write once space is freed (no restart needed);
+- `enqueue_request` stays bounded regardless: the staged buffer is capped
+  (`REQUEST_BUFFER_MAX`, default 10k rows) and sheds the **oldest** records
+  over capacity, counted in `dropped_requests`;
+- `reconcile_servers` (startup) degrades to default rows — every server
+  **unowned**, `power_state=unknown` — the safe direction per D12 (the proxy
+  never powers off a box it did not bring up); adoption re-happens on
+  traffic;
+- a full disk at **boot** delays startup: the migration step retries every
+  10 s (one-time ERROR) instead of failing the lifespan;
+- memory-first ordering: power/ownership state changes apply in memory
+  *before* the store mirror (memory is what routing and the shutdown engine
+  use; the DB is the mirror).
+
+Code-level SQL bugs (`ProgrammingError`, `IntegrityError`,
+`NotSupportedError`) are NOT environmental: they still raise.
+
+**Visibility:** `/healthz` stays 200 while degraded (a 503 would make an
+orchestrator restart the process, losing the in-memory queue, without fixing
+the disk) and reports `"store": "degraded" | "ok"` for alerting;
+`/monitor/data` carries a `store` block (`degraded`, `dropped_writes`,
+`dropped_requests`, `path`) and the monitor page shows a banner.
+
+**Trade-off (deliberate):** while degraded, history rows (requests,
+sessions, power events, runtime mirrors) are lost. Proxying is never lost.
+
 ## Schema
 
 The SQLAlchemy models in `relay/db.py` are the single source of truth —
@@ -95,3 +137,10 @@ At boot, after loading config:
   (schema built straight from the metadata, no Alembic), never the real
   `relay.db`.
 - Expose a `Store.close()` used by the app lifespan and test fixtures.
+- `RELAY_STORE_FAIL_WRITES=<path>` (test hook for D33, read by
+  `make_engine`): while the file at `<path>` exists, every commit raises
+  the same `OperationalError` a full disk produces, exercising the
+  degraded-mode path end to end (e2e) without a full filesystem, root, or
+  tmpfs. Creating/removing the file at runtime simulates the disk filling
+  up and being drained again (see `tests/e2e/test_disk_full.py`). Never set
+  this in a real deployment.
