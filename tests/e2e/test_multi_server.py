@@ -124,3 +124,43 @@ async def test_multi_independent_shutdown(multi_env):
         assert servers["beta"]["power_state"] == "on", f"beta is still on: {servers['beta']}"
     finally:
         env.stop()
+
+
+async def test_ec2_boot_latency(ec2_env):
+    # Phase 2 (D10): an aws-ec2 server, its instance ``stopped``, the target
+    # DOWN. A request wakes the instance through the real boto3 path
+    # (start_instances -> pending -> running after the boot delay), but the
+    # endpoint stays not-ready until the target comes up: the request must
+    # wait through both the slow boot and the target start.
+    env = await ec2_env.make("boot", boot_delay=2.0)
+    try:
+        started = time.monotonic()
+
+        async def request() -> httpx.Response:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{env.port}", timeout=60) as c:
+                return await c.post("/e/echo", json={"x": 1})
+
+        pending = asyncio.create_task(request())
+
+        # The proxy issues start_instances and the instance boots
+        # (pending -> running) while the target is still down.
+        async def booted() -> bool:
+            return await env.ec2_state() == "running"
+
+        assert await wait_for(booted, timeout=30), "the instance reached running"
+        eps = _endpoints(await env.monitor())
+        assert eps["ec2-api"]["ready"] is False, (
+            f"instance running but target down: not ready: {eps['ec2-api']}"
+        )
+        await env.start_target()
+        response = await pending
+        waited = time.monotonic() - started
+        assert response.status_code == 200, (
+            f"request served after boot + target up: {response.status_code} {response.text[:200]}"
+        )
+        assert waited >= 1.5, f"the request waited through the slow boot (waited {waited:.1f}s)"
+        assert "start_instances" in await env.ec2_actions(), "proxy issued start_instances"
+        servers = _servers(await env.monitor())
+        assert servers["ec2box"]["power_state"] == "on", f"instance on: {servers['ec2box']}"
+    finally:
+        env.stop()
