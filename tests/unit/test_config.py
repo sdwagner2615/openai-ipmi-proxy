@@ -335,6 +335,111 @@ endpoints:""",
     assert config.clients[0].status.password == ""
 
 
+def test_clients_section_parses_values_and_defaults(tmp_path):
+    text = (
+        VALID
+        + """
+clients:
+  - name: opencode
+    match:
+      ua_prefix: opencode/
+      session_headers: [x-opencode-session]
+      gated_session_headers: [x-session-id]
+    status:
+      kind: opencode
+      port: 4096
+    children:
+      kind: parent-chain
+      depth: 3
+"""
+    )
+    config = load_config(write_config(tmp_path, text))
+    client = config.clients[0]
+    assert client.match.ua_prefix == "opencode/"
+    assert client.match.session_headers == ["x-opencode-session"]
+    assert client.match.gated_session_headers == ["x-session-id"]
+    assert client.status.kind == "opencode"
+    assert client.status.port == 4096
+    # opencode's pending-input endpoints are the default (parity: the legacy
+    # client had them hardcoded).
+    assert client.status.pending_paths == ["/permission", "/question"]
+    assert client.children.kind == "parent-chain"
+    assert client.children.depth == 3
+
+
+def test_client_kind_none_disables_pending_poll_defaults(tmp_path):
+    text = (
+        VALID
+        + """
+clients:
+  - name: mytool
+    match:
+      session_headers: [x-mytool-session]
+    status:
+      kind: none
+"""
+    )
+    config = load_config(write_config(tmp_path, text))
+    client = config.clients[0]
+    assert client.status.kind == "none"
+    assert client.status.pending_paths == []
+    assert client.children.kind == "none"
+
+
+def test_duplicate_client_names_rejected(tmp_path):
+    text = (
+        VALID
+        + """
+clients:
+  - name: a
+    match: {session_headers: [x-a]}
+  - name: a
+    match: {session_headers: [x-b]}
+"""
+    )
+    with pytest.raises(ConfigError, match="duplicate client name"):
+        load_config(write_config(tmp_path, text))
+
+
+def test_client_status_kind_enum_enforced(tmp_path):
+    text = (
+        VALID
+        + """
+clients:
+  - name: a
+    match: {session_headers: [x-a]}
+    status: {kind: bogus}
+"""
+    )
+    with pytest.raises(ConfigError, match="kind"):
+        load_config(write_config(tmp_path, text))
+
+
+def test_client_children_kind_enum_and_depth_enforced(tmp_path):
+    text = (
+        VALID
+        + """
+clients:
+  - name: a
+    match: {session_headers: [x-a]}
+    children: {kind: bogus}
+"""
+    )
+    with pytest.raises(ConfigError, match="kind"):
+        load_config(write_config(tmp_path, text))
+    text = (
+        VALID
+        + """
+clients:
+  - name: a
+    match: {session_headers: [x-a]}
+    children: {kind: parent-chain, depth: 0}
+"""
+    )
+    with pytest.raises(ConfigError, match="depth"):
+        load_config(write_config(tmp_path, text))
+
+
 def test_config_file_missing_is_an_error(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "nope.yaml")

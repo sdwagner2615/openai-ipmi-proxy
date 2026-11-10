@@ -173,6 +173,9 @@ clients:
   K/V cache), not the platform.
 - **`clients`** entries are optional; without any, every client is generic
   (IP-identified, busy-window status).
+- **`status.kind: none`** — the client is identified (its `name` and match
+  rules apply, sessions are scoped under it) but carries no status source:
+  its sessions get busy-window inference only, exactly like unknown clients.
 - **`pending_paths`** — the endpoints that report a session blocked on user
   input (a pending entry releases the session's spot immediately: the
   "waiting" state). Defaults to `[/permission, /question]` for

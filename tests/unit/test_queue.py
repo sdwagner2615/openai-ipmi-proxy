@@ -35,8 +35,14 @@ def make_queue(**overrides) -> EndpointQueue:
     return queue
 
 
-def make_entry(queue: EndpointQueue, client: str, session_id: str, request=None) -> QueueEntry:
-    session = queue.get_or_create_session(client, session_id, "openai", "1.2.3.4", "ua")
+def make_entry(
+    queue: EndpointQueue, client: str, session_id: str, request=None, known: bool | None = None
+) -> QueueEntry:
+    # Default mirrors the runtime: a named white-glove client with a status
+    # source is known, "unknown" is not.
+    if known is None:
+        known = client != "unknown"
+    session = queue.get_or_create_session(client, session_id, "openai", "1.2.3.4", "ua", known)
     return QueueEntry(
         session=session,
         path="/v1/chat/completions",
@@ -139,6 +145,20 @@ def test_unknown_client_release_deadline_is_max_busy_window_expiry():
     assert q._release_deadline(e.session, now) == e.session.last_request_at + 4
 
 
+def test_named_client_without_status_source_uses_busy_window():
+    # status.kind: none -> identified by name but no reports: the session
+    # behaves like an unknown client's (busy-window inference, not the
+    # immediate idle a report-less "known" client would otherwise get).
+    q = make_queue(busy_window=2, session_expiry=4)
+    e = make_entry(q, "mytool", "s1", known=False)
+    q.enqueue(e)
+    q.release(e, 200)
+    now = time.monotonic()
+    assert q._current_status(e.session, now + 0.1) == ("busy", "")
+    assert q._release_deadline(e.session, now) == e.session.last_request_at + 4
+    assert q._current_status(e.session, now + 2.5) == ("idle", "")
+
+
 def test_known_client_idle_release_deadlines():
     q = make_queue(immediate_idle_release=True)
     e = make_entry(q, "opencode", "s1")
@@ -233,7 +253,7 @@ def test_shared_spot_lets_a_child_run_on_the_ancestors_spot():
     q = make_queue(max_spots=1)
     parent = make_entry(q, "opencode", "parent")
     q.enqueue(parent)
-    child_session = q.get_or_create_session("opencode", "child", "openai", "1.2.3.4", "ua")
+    child_session = q.get_or_create_session("opencode", "child", "openai", "1.2.3.4", "ua", True)
     child_session.shared_spot_key = parent.session.key
     child = QueueEntry(
         session=child_session,
