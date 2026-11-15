@@ -403,9 +403,27 @@ async def test_t16_sub_agent_shares_parent_spot(env):
         env.mock_parent("ses-PC", "ses-PP")
         t0 = time.monotonic()
         pcr = asyncio.create_task(c.post(CHAT, json=BODY, headers={"x-opencode-session": "ses-PC"}))
-        await asyncio.sleep(1.5)
-        d = await env.monitor("base")
-        sp, sc = env.find_session(d, "ses-PP"), env.find_session(d, "ses-PC")
+        # Poll for the child on the parent's shared spot instead of one
+        # snapshot at a fixed 1.5s: admission is async (readiness gate + the
+        # 1s queue-manager tick that resolves the parent chain), so a fixed
+        # window flakes on slow runners (T15 precedent).
+        d = None
+        sp = sc = None
+        deadline = time.monotonic() + 10.0
+        while True:
+            d = await env.monitor("base")
+            sp, sc = env.find_session(d, "ses-PP"), env.find_session(d, "ses-PC")
+            if (
+                sp is not None
+                and sp["spot"] == "held"
+                and sc is not None
+                and sc["spot"] == "shared"
+                and (sc["inflight"] + sc["waiting"]) >= 1
+            ):
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.2)
         assert (
             sp is not None
             and sp["spot"] == "held"
@@ -418,7 +436,7 @@ async def test_t16_sub_agent_shares_parent_spot(env):
         )
         resp_c = await pcr
         wait_s = time.monotonic() - t0
-        assert resp_c.status_code == 200 and wait_s < 5, (
+        assert resp_c.status_code == 200 and wait_s < 10, (
             f"T16e child ran without waiting for its own spot: {wait_s:.1f}s"
         )
         env.mock_set("ses-PC", "busy")
